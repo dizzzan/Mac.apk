@@ -131,6 +131,30 @@ public class Surface implements android.os.Parcelable {
         SurfaceView.macapkNoteNativeWindowOwner(mOwnerSurfaceView);
     }
 
+    /** Post a CPU ANativeWindow buffer to this Surface's own consumer. The
+     * native producer transfers ownership of a fresh packed ARGB array. */
+    public boolean macapkPostNativeFrame(int[] pixels, int width, int height) {
+        if (mReleased || pixels == null || width <= 0 || height <= 0
+                || (long) width * height > pixels.length) return false;
+        if (mSurfaceTexture != null) {
+            if (mSurfaceTexture.isReleased()) return false;
+            mSurfaceTexture.macapkQueueProducerFrame(pixels, width, height, width,
+                null, null, false);
+            return true;
+        }
+        if (mOwnerSurfaceView != null) {
+            if (mOwnerSurfaceView.macapkPresentThroughSurfaceLayer(pixels, width, height)) return true;
+            int[] placed = mOwnerSurfaceView.macapkPlaceInDisplay(pixels, width, height);
+            if (placed != null) {
+                pixels = placed;
+                width = mOwnerSurfaceView.macapkCompositeW;
+                height = mOwnerSurfaceView.macapkCompositeH;
+            }
+        }
+        com.macapk.loader.NativeCocoa.presentBitmap(pixels, width, height);
+        return true;
+    }
+
     private void checkNotReleased() {
         // AOSP Surface.checkNotReleasedLocked(): IllegalStateException,
         // exact message, once the native object is gone. We track the same

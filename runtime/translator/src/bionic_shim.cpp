@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "native_window_pixels.h"
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
@@ -14107,6 +14108,15 @@ chain:
             t_ill_same_count = 1;
         }
         const bool looping = (t_ill_same_count >= kMaxSamePcTraps);
+        // A later, independent deoptimization can trap at this same call site
+        // again. Only count consecutive UNHANDLED re-traps: a handler that
+        // redirects the saved PC has serviced the signal and ends the streak.
+        auto note_progress = [&] {
+            if (uc->uc_mcontext && uc->uc_mcontext->__ss.__pc != pc_log) {
+                t_ill_last_pc = 0;
+                t_ill_same_count = 0;
+            }
+        };
 
         // Chain to the saved prior SIGILL handler (HotSpot's, captured
         // post-JVM-init) unless we are looping on this PC. Mirrors the
@@ -14117,7 +14127,10 @@ chain:
             // guest code then reaches a recorded guest action (OpenSSL's
             // OPENSSL_cpuid_setup probe handler, which siglongjmps out) instead
             // of HotSpot's fatal-error path.
-            if (__macapk_sigchain_deliver(sig, info, ucontext)) return;
+            if (__macapk_sigchain_deliver(sig, info, ucontext)) {
+                note_progress();
+                return;
+            }
             const struct sigaction& prev = g_old_ill_sa;
             if (prev.sa_flags & SA_SIGINFO) {
                 if (prev.sa_sigaction) {
@@ -14129,6 +14142,7 @@ chain:
                         (void*)prev.sa_sigaction, t_ill_same_count);
                     std::fflush(stderr);
                     prev.sa_sigaction(sig, info, ucontext);
+                    note_progress();
                     return;
                 }
             } else if (prev.sa_handler == SIG_IGN) {
@@ -14143,6 +14157,7 @@ chain:
                     (void*)pc_log, insn_log, t_ill_same_count);
                 std::fflush(stderr);
                 prev.sa_handler(sig);
+                note_progress();
                 return;
             }
         }
@@ -36129,6 +36144,7 @@ struct MacApkNativeWindow {
     int32_t  format;    // WINDOW_FORMAT_RGBA_8888 = 1
     void*    layer;     // CAMetalLayer* from CocoaGetUnityRenderLayer
     uint8_t  reserved[96];
+    int32_t buffer_width = 0, buffer_height = 0;
 };
 static constexpr uint32_t kMacApkNWMagic = 0x4D444E57; // 'MDNW'
 alignas(16) static MacApkNativeWindow g_macapk_unity_window = {};
@@ -64187,6 +64203,8 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
     // query -> mCore->mDefaultWidth), which Unreal divides touch X/Y by.
     if (width < 0 || height < 0 || (width == 0) != (height == 0)) return -EINVAL;
     if (!macapk_is_unity_window(w)) return 0;
+    g_macapk_unity_window.buffer_width = width;
+    g_macapk_unity_window.buffer_height = height;
     if (format != 0) g_macapk_unity_window.format = format;
     using GeoFn = void (*)(int, int);
     static GeoFn set_geo = reinterpret_cast<GeoFn>(
@@ -64342,59 +64360,94 @@ extern "C" void* __macapk_arm64_ANativeWindow_toSurface(void* /*env*/,
 // a real, correctly-described, zero-filled buffer instead, so the documented
 // contract (return 0 => outBuffer is usable) actually holds.
 //
-// The buffer is not yet composited to the CAMetalLayer on unlockAndPost: that
-// blit belongs with the Canvas/SurfaceView software-present path outside this
-// file. Until it lands, unlockAndPost reports the honest "posted nothing"
-// outcome by returning 0 for a valid lock (the NDK contract has no "posted but
-// not displayed" code) while never handing back an unusable pointer.
+// CPU buffers are converted to packed Android ARGB and posted to the exact
+// Java Surface captured at lock time, using its existing SurfaceTexture or
+// SurfaceView consumer instead of replacing the whole window's canvas.
 namespace {
 struct MacApkANWBuffer {
-    int32_t  width, height, stride, format;
-    void*    bits;
+    int32_t width, height, stride, format;
+    void* bits;
     uint32_t reserved[6];
 };
 struct MacApkARect { int32_t left, top, right, bottom; };
-std::mutex           g_anw_lock_mu;
+std::mutex g_anw_lock_mu;
 std::vector<uint8_t> g_anw_lock_pixels;
-bool                 g_anw_locked = false;
-}  // namespace
+macapk::native_window::Layout g_anw_layout;
+bool g_anw_locked = false;
+void* g_anw_locked_window = nullptr;
+jobject g_anw_locked_surface = nullptr;
+}
 extern "C" int32_t __macapk_arm64_ANativeWindow_lock(
         void* w, void* outBuffer, void* inOutDirtyBounds) {
     auto* out = reinterpret_cast<MacApkANWBuffer*>(outBuffer);
     if (!out) return -EINVAL;
-    const int32_t width  = __macapk_arm64_ANativeWindow_getWidth(w);
-    const int32_t height = __macapk_arm64_ANativeWindow_getHeight(w);
-    if (width <= 0 || height <= 0) return -EINVAL;
-    const size_t need = size_t(width) * size_t(height) * 4u;
     std::lock_guard<std::mutex> lk(g_anw_lock_mu);
-    if (g_anw_locked) return -EBUSY;   // a second lock without unlockAndPost
-    if (g_anw_lock_pixels.size() != need) {
-        // Bionic and Darwin agree on errno 1..34, so EINVAL(22)/EBUSY(16)/
-        // ENOMEM(12) need no mac2lin translation on the way out.
-        try { g_anw_lock_pixels.assign(need, 0); }
-        catch (const std::exception&) { return -ENOMEM; }
+    if (g_anw_locked) return -EBUSY;
+    int width = __macapk_arm64_ANativeWindow_getWidth(w);
+    int height = __macapk_arm64_ANativeWindow_getHeight(w);
+    if (macapk_is_unity_window(w) && g_macapk_unity_window.buffer_width > 0) {
+        width = g_macapk_unity_window.buffer_width;
+        height = g_macapk_unity_window.buffer_height;
     }
-    g_anw_locked  = true;
-    out->width    = width;
-    out->height   = height;
-    out->stride   = width;                 // stride is in PIXELS, not bytes
-    out->format   = __macapk_arm64_ANativeWindow_getFormat(w);
-    out->bits     = g_anw_lock_pixels.data();
-    std::memset(out->reserved, 0, sizeof(out->reserved));
-    // inOutDirtyBounds is in/out: the caller asks for a region and the window
-    // reports back the region it must actually redraw ("often extended"). We
-    // keep no partial-update history, so the honest answer is the whole
-    // surface.
-    if (auto* r = reinterpret_cast<MacApkARect*>(inOutDirtyBounds)) {
-        r->left = 0; r->top = 0; r->right = width; r->bottom = height;
+    macapk::native_window::Layout layout;
+    if (!macapk::native_window::layout(width, height,
+            __macapk_arm64_ANativeWindow_getFormat(w), layout)) return -EINVAL;
+    try { g_anw_lock_pixels.resize(layout.bytes); }
+    catch (const std::exception&) { return -ENOMEM; }
+    AttachGuard ag;
+    if (!ag.env || ag.env->ExceptionCheck()) return -EINVAL;
+    {
+        std::lock_guard<std::mutex> surface_lk(g_macapk_nw_surface_mu);
+        if (g_macapk_nw_surface_gref)
+            g_anw_locked_surface = ag.env->NewGlobalRef(g_macapk_nw_surface_gref);
     }
+    if (!g_anw_locked_surface) {
+        if (ag.env->ExceptionCheck()) ag.env->ExceptionClear();
+        return -ENOMEM;
+    }
+    g_anw_layout = layout;
+    g_anw_locked = true;
+    g_anw_locked_window = w;
+    *out = {width, height, layout.stride, layout.format, g_anw_lock_pixels.data(), {0}};
+    if (auto* r = reinterpret_cast<MacApkARect*>(inOutDirtyBounds))
+        *r = {0, 0, width, height};
     return 0;
 }
-extern "C" int32_t __macapk_arm64_ANativeWindow_unlockAndPost(void* /*w*/) {
+extern "C" int32_t __macapk_arm64_ANativeWindow_unlockAndPost(void* w) {
     std::lock_guard<std::mutex> lk(g_anw_lock_mu);
-    if (!g_anw_locked) return -EINVAL;    // unlock without a matching lock
+    if (!g_anw_locked || w != g_anw_locked_window) return -EINVAL;
     g_anw_locked = false;
-    return 0;
+    AttachGuard ag;
+    if (!ag.env) return -EINVAL;
+    jobject surface = g_anw_locked_surface;
+    g_anw_locked_surface = nullptr;
+    if (ag.env->ExceptionCheck()) {
+        if (surface) ag.env->DeleteGlobalRef(surface);
+        return -EINVAL;
+    }
+    const auto l = g_anw_layout;
+    jintArray pixels = ag.env->NewIntArray(jsize(size_t(l.width) * l.height));
+    int result = -ENOMEM;
+    if (pixels) {
+        std::vector<uint32_t> argb;
+        try {
+            argb.resize(size_t(l.width) * l.height);
+            macapk::native_window::to_argb(l, g_anw_lock_pixels.data(), argb.data());
+            ag.env->SetIntArrayRegion(pixels, 0, jsize(argb.size()), reinterpret_cast<const jint*>(argb.data()));
+            jclass cls = ag.env->GetObjectClass(surface);
+            jmethodID post = cls ? ag.env->GetMethodID(cls, "macapkPostNativeFrame", "([III)Z") : nullptr;
+            if (post && !ag.env->ExceptionCheck())
+                result = ag.env->CallBooleanMethod(surface, post, pixels, l.width, l.height) ? 0 : -EINVAL;
+            if (cls) ag.env->DeleteLocalRef(cls);
+        } catch (const std::exception&) { result = -ENOMEM; }
+        ag.env->DeleteLocalRef(pixels);
+    }
+    if (ag.env->ExceptionCheck()) { ag.env->ExceptionClear(); result = -EINVAL; }
+    if (surface) ag.env->DeleteGlobalRef(surface);
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 4)
+        std::fprintf(stderr, "[arm64-shim] ANativeWindow CPU post %dx%d format=%d -> %d\n", l.width, l.height, l.format, result);
+    return result;
 }
 
 // =========================================================================

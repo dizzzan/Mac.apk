@@ -2664,6 +2664,8 @@ public class Canvas {
             int ee = MacApkFont.emojiClusterEnd(text, i, n);
             if (ee > i) {
                 String ec = text.substring(i, ee);
+                Font base = MacApkFont.fallbackBaseFor(text.codePointAt(i), primary);
+                g.setFont(base == null ? primary : MacApkFont.atSizeOf(base, primary));
                 g.drawString(ec, cx, y);
                 cx += MacApkFont.emojiAdvance(sizePx);
                 i = ee;

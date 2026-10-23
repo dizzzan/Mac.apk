@@ -2164,6 +2164,7 @@ public final class ActivityHost {
         try { a.macapkAttachBareSurfaceRoot(); } catch (Throwable ignored) { }
         runTolerant(a, "onWindowFocusChanged",
                     new Class<?>[]{boolean.class}, new Object[]{Boolean.TRUE});
+        a.macapkDispatchWindowFocusToViews(true);
         // v1.0.409: re-drive view-tree ViewTreeLifecycleOwner registries now that
         // the surface is up and any deferred content (Conductor controller view +
         // its ComposeView) has attached -- so the recomposer that bound at attach
@@ -3917,6 +3918,7 @@ public final class ActivityHost {
                 if (focusDeliveredTo == outgoing) focusDeliveredTo = null;
                 runTolerant(outgoing, "onWindowFocusChanged",
                             new Class<?>[]{boolean.class}, new Object[]{Boolean.FALSE});
+                outgoing.macapkDispatchWindowFocusToViews(false);
             }
             runTolerant(outgoing, "onPause", new Class<?>[0], new Object[0]);
             // ON_PAUSE takes the androidx registry back down to STARTED, which

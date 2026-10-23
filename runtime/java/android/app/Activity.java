@@ -1153,6 +1153,25 @@ public class Activity extends ContextThemeWrapper
         return false;
     }
 
+    /** ViewRootImpl delivers focus to the view hierarchy and its tree observer
+     *  as well as the window callback. Our decor and render root can be separate
+     *  trees, so notify both without dispatching a shared observer twice. */
+    public void macapkDispatchWindowFocusToViews(boolean hasFocus) {
+        View decor = getWindow() != null ? getWindow().peekDecorView() : null;
+        View root = contentView != null ? contentView.getRootView() : null;
+        android.view.ViewTreeObserver decorObserver = null;
+        if (decor != null) {
+            decor.dispatchWindowFocusChanged(hasFocus);
+            decorObserver = decor.getViewTreeObserver();
+            decorObserver.dispatchOnWindowFocusChange(hasFocus);
+        }
+        if (root != null && root != decor) {
+            root.dispatchWindowFocusChanged(hasFocus);
+            android.view.ViewTreeObserver observer = root.getViewTreeObserver();
+            if (observer != decorObserver) observer.dispatchOnWindowFocusChange(hasFocus);
+        }
+    }
+
     /** AOSP setVisible(boolean): the client-side half of "should my window be
      *  shown yet" -- an activity that needs to finish or redirect before
      *  onResume calls setVisible(false) so its UI never flashes. AOSP hides the
