@@ -52,6 +52,7 @@
 #include <algorithm>
 #include "a64_inline_data.h"
 #include "a64_shadow_page.h"
+#include "a64_vfork.h"
 #include <array>
 #include <atomic>
 #include <capstone/capstone.h>  // generic x18 platform-register rewriter
@@ -11639,6 +11640,8 @@ size_t Image::apply_svc_shadow_pages() {
                          dbg_name_, (unsigned long long)(page - reinterpret_cast<uintptr_t>(base_)));
             continue;
         }
+        if (size_t n = macapk::a64::omit_unsupported_vfork_pid_cache(relocated))
+            std::fprintf(stderr, "[svc-shadow] %s: %zu unsupported vfork wrapper(s) use the syscall error path without Bionic PID-cache writes\n", dbg_name_, n);
         std::memcpy(reinterpret_cast<void*>(shadow), relocated.data(), relocated.size() * 4);
         sys_icache_invalidate(reinterpret_cast<void*>(shadow), relocated.size() * 4);
         if (mprotect(reinterpret_cast<void*>(shadow), allocation_size, PROT_READ | PROT_EXEC) != 0 ||

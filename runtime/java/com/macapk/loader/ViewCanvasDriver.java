@@ -109,6 +109,16 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
         // Drop bitmap so next draw reallocates at new size.
         bitmap = null;
         canvas = null;
+        // A resize requests a traversal; it must not create app fragments from
+        // inside the surface notification. doFrame drives Choreographer before
+        // measuring/layout, so animation/input and app frame callbacks run in
+        // their normal order. Eager measurement here bypassed that ordering and
+        // could instantiate a ViewPager page before its player initialization.
+        // Keep the legacy direct-render loop's old path below.
+        if (android.os.Looper.MACAPK_REAL_LOOPER) {
+            android.view.ViewRootImpl.scheduleLayout();
+            return;
+        }
         // Hand the view-tree the new dimensions via onSizeChanged-
         // adjacent callback; we use the layout setter for simplicity.
         // v1.0.134: inset the layout by the status-bar height so the
