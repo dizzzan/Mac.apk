@@ -343,7 +343,9 @@ public class ContentResolver {
                 android.content.res.AssetFileDescriptor.UNKNOWN_LENGTH);
         }
         ContentProvider p = providerFor(uri);
-        if (p == null) return null;
+        // A missing provider is an open failure, not a provider returning null.
+        // Media clients catch this exception to fall back to their URL reader.
+        if (p == null) throw new java.io.FileNotFoundException("No content provider: " + uri);
         p.macapkEnforceFile(uri, mode);
         return p.openAssetFile(uri, mode, sig);   // Transport.openAssetFile's 3-arg call
     }
@@ -354,7 +356,7 @@ public class ContentResolver {
     public final android.content.res.AssetFileDescriptor openTypedAssetFileDescriptor(Uri uri, String mimeType, Bundle opts, CancellationSignal sig)
             throws java.io.FileNotFoundException {
         ContentProvider p = providerFor(uri);
-        if (p == null) return null;
+        if (p == null) throw new java.io.FileNotFoundException("No content provider: " + uri);
         p.macapkEnforceFile(uri, "r");   // Transport.openTypedAssetFile
         // The 4-arg call Transport makes (android14 ContentProvider.java:667).
         return p.openTypedAssetFile(uri, mimeType, opts, sig);
