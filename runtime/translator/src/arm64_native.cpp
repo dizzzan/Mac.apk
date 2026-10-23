@@ -50,6 +50,7 @@
 // means executing the original instructions, not re-emitting them.
 
 #include <algorithm>
+#include "a64_inline_data.h"
 #include <array>
 #include <atomic>
 #include <capstone/capstone.h>  // generic x18 platform-register rewriter
@@ -11234,15 +11235,23 @@ size_t Image::apply_svc_brk_rewrite() {
     // the state alone no longer implies this gate); otherwise the whole-segment
     // scan, exactly as before.
     const bool exec_only = macapk_svc_brk_exec_only() && exec_ranges_state_ == 1;
-    size_t n = 0, spared = 0, nosec_n = 0;
+    size_t n = 0, spared = 0, nosec_n = 0, inline_spared = 0;
     for (const auto& ph : phdrs_) {
         if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
         uint8_t* lo = base_ + ph.p_vaddr;
         uint8_t* hi = lo + ph.p_filesz;
+        std::vector<macapk::a64::InlineDataRange> inline_data;
+        if (std::getenv("MACAPK_SVC_INLINE_DATA"))
+            inline_data = macapk::a64::lr_skipped_ranges(lo, ph.p_filesz, (uint64_t)lo);
         size_t seg_n = 0;
         for (uint32_t* p = reinterpret_cast<uint32_t*>(lo);
              reinterpret_cast<uint8_t*>(p + 1) <= hi; ++p) {
             if (*p != kSvc0) continue;
+            bool skipped = false;
+            for (auto range : inline_data) {
+                if ((uint64_t)p >= range.lo && (uint64_t)p < range.hi) { skipped = true; break; }
+            }
+            if (skipped) { ++inline_spared; continue; }
             if (exec_only) {
                 bool nosec = false;
                 if (text_word_is_data(uint64_t(reinterpret_cast<uint8_t*>(p) - base_), &nosec)) {
@@ -11262,6 +11271,9 @@ size_t Image::apply_svc_brk_rewrite() {
             "rodata) was rewritten too (MACAPK_SVC_BRK_EXEC_ONLY fallback)\n",
             dbg_name_, exec_ranges_why_);
     }
+    if (inline_spared)
+        std::fprintf(stderr, "[arm64-native] %s: svc->BRK left %zu word(s) in LR-skipped inline data untouched\n",
+                     dbg_name_, inline_spared);
     if (spared) {
         std::fprintf(stderr,
             "[arm64-native] %s: svc->BRK left %zu 0xD4000001 word(s) in NON-executable "
