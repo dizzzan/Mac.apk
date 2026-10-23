@@ -385,6 +385,9 @@ public final class Settings {
 
     public static class Secure extends NameValueTable {
         public static final String ANDROID_ID         = "android_id";
+        /** @deprecated Moved to Global in API 17; the public alias remains in AOSP. */
+        @Deprecated
+        public static final String ADB_ENABLED = Global.ADB_ENABLED;
         public static final String LOCATION_PROVIDERS_ALLOWED = "location_providers_allowed";
 
         /**
@@ -427,49 +430,55 @@ public final class Settings {
         public static final android.net.Uri CONTENT_URI =
             android.net.Uri.parse("content://settings/secure");
 
+        private static String namespaceFor(String name) {
+            // AOSP Secure's MOVED_TO_GLOBAL entries read and write the global table.
+            return Global.ADB_ENABLED.equals(name) ? SettingsStore.NS_GLOBAL : SettingsStore.NS_SECURE;
+        }
+
         public static String getString(ContentResolver cr, String name) {
-            return SettingsStore.getString(SettingsStore.NS_SECURE, name);
+            return SettingsStore.getString(namespaceFor(name), name);
         }
         public static int getInt(ContentResolver cr, String name) throws SettingNotFoundException {
-            return parseIntOrThrow(SettingsStore.getString(SettingsStore.NS_SECURE, name), name);
+            return parseIntOrThrow(SettingsStore.getString(namespaceFor(name), name), name);
         }
         public static int getInt(ContentResolver cr, String name, int def) {
-            return parseInt(SettingsStore.getString(SettingsStore.NS_SECURE, name), def);
+            return parseInt(SettingsStore.getString(namespaceFor(name), name), def);
         }
         public static long getLong(ContentResolver cr, String name) throws SettingNotFoundException {
-            return parseLongOrThrow(SettingsStore.getString(SettingsStore.NS_SECURE, name), name);
+            return parseLongOrThrow(SettingsStore.getString(namespaceFor(name), name), name);
         }
         public static long getLong(ContentResolver cr, String name, long def) {
-            return parseLong(SettingsStore.getString(SettingsStore.NS_SECURE, name), def);
+            return parseLong(SettingsStore.getString(namespaceFor(name), name), def);
         }
         public static float getFloat(ContentResolver cr, String name) throws SettingNotFoundException {
-            return parseFloatOrThrow(SettingsStore.getString(SettingsStore.NS_SECURE, name), name);
+            return parseFloatOrThrow(SettingsStore.getString(namespaceFor(name), name), name);
         }
         public static float getFloat(ContentResolver cr, String name, float def) {
-            return parseFloat(SettingsStore.getString(SettingsStore.NS_SECURE, name), def);
+            return parseFloat(SettingsStore.getString(namespaceFor(name), name), def);
         }
         public static boolean putString(ContentResolver cr, String name, String value) {
-            boolean ok = SettingsStore.putString(SettingsStore.NS_SECURE, name, value);
+            boolean ok = SettingsStore.putString(namespaceFor(name), name, value);
             if (ok) notifyChanged(cr, getUriFor(name));
             return ok;
         }
         public static boolean putInt(ContentResolver cr, String name, int value) {
-            boolean ok = SettingsStore.putString(SettingsStore.NS_SECURE, name, Integer.toString(value));
+            boolean ok = SettingsStore.putString(namespaceFor(name), name, Integer.toString(value));
             if (ok) notifyChanged(cr, getUriFor(name));
             return ok;
         }
         public static boolean putLong(ContentResolver cr, String name, long value) {
-            boolean ok = SettingsStore.putString(SettingsStore.NS_SECURE, name, Long.toString(value));
+            boolean ok = SettingsStore.putString(namespaceFor(name), name, Long.toString(value));
             if (ok) notifyChanged(cr, getUriFor(name));
             return ok;
         }
         public static boolean putFloat(ContentResolver cr, String name, float value) {
-            boolean ok = SettingsStore.putString(SettingsStore.NS_SECURE, name, Float.toString(value));
+            boolean ok = SettingsStore.putString(namespaceFor(name), name, Float.toString(value));
             if (ok) notifyChanged(cr, getUriFor(name));
             return ok;
         }
         /** AOSP Secure.getUriFor(name) = content://settings/secure/<name>. */
         public static android.net.Uri getUriFor(String name) {
+            if (Global.ADB_ENABLED.equals(name)) return Global.getUriFor(name);
             return android.net.Uri.parse("content://settings/secure/" + name);
         }
     }

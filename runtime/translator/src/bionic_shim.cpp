@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "native_window_pixels.h"
+#include "a64_dynamic_syscall.h"
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
@@ -35881,8 +35882,15 @@ static bool macapk_path_in_guest_lib_dir(const std::string& p) {
 extern "C" int __macapk_arm64_dladdr(const void* addr, Dl_info* info) {
     if (!macapk_guest_dladdr_on()) return ::dladdr(addr, info);
     if (!info) return 0;
-    if (__macapk_arm64_native_dladdr(addr, info)) return 1;
-    return ::dladdr(addr, info);
+    int result = __macapk_arm64_native_dladdr(addr, info);
+    if (!result) result = ::dladdr(addr, info);
+    if (std::getenv("MACAPK_DLADDR_TRACE")) {
+        std::fprintf(stderr, "[dladdr] addr=%p rc=%d base=%p file=%s caller=%p\n",
+                     addr, result, result ? info->dli_fbase : nullptr,
+                     result && info->dli_fname ? info->dli_fname : "?",
+                     __builtin_return_address(0));
+    }
+    return result;
 }
 
 extern "C" int __macapk_elfexec_guest_dlopen(const char* path, int bionic_flag, void** out);
@@ -38874,7 +38882,7 @@ extern "C" const char* __macapk_arm64_eglQueryString(void* dpy, int32_t name) {
 extern "C" void* __macapk_arm64_dlvsym(void* handle, const char* symbol, const char* version);
 // ---------------------------------------------------------------------------
 // MACAPK_WRAPPER_DATA_DLSYM (default ON): dlsym on a handle from the dlopen
-// redirect below finds the library's DATA exports too, as bionic's does.
+// redirect below returns the library's original ELF exports, as bionic's does.
 //
 // A translated library is a Mach-O wrapper whose exports are one `br x16`
 // trampoline per FUNCTION (arm64_pack.cpp is_exportable skips STT_OBJECT), so
@@ -38887,10 +38895,14 @@ extern "C" void* __macapk_arm64_dlvsym(void* handle, const char* symbol, const c
 // STT_OBJECT; every one came back NULL, and the engine aborted with "VM
 // snapshot invalid and could not be inferred from settings" before its first
 // frame (Feeel 2.4.1, Ente Auth). So the redirect remembers which library a
-// handle stands for, and a host-dlsym miss on that handle asks the loaded ELF
-// image itself (__macapk_arm64_native_lookup_latest). Function lookups are
-// unchanged: the host dlsym answers them first. =0 restores the host-only
-// answer.
+// handle stands for and asks the loaded ELF image itself
+// (__macapk_arm64_native_lookup_latest). Function lookups must also return
+// the ELF address: a wrapper trampoline is callable but has
+// different pointer identity, and dladdr would report its Mach-O wrapper base.
+// A caller using that base with ELF symbol/segment offsets then reads unrelated
+// memory. Prefer the registered ELF for both functions and data; host lookups
+// still cover symbols not defined there. The historical flag name is retained;
+// =0 restores the host-only answer.
 extern "C" void* __macapk_arm64_native_lookup_latest(const char* soname,
                                                      const char* sym);
 static bool macapk_wrapper_data_dlsym_on() {
@@ -39150,8 +39162,8 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             name, p);
         return p;
     }
-    if (void* p = dlsym(handle, name)) return p;
-    return macapk_wrapper_elf_dlsym(handle, name);
+    if (void* p = macapk_wrapper_elf_dlsym(handle, name)) return p;
+    return dlsym(handle, name);
 }
 
 // Tracing wrapper (exported name preserved for the loader's resolve_external).
@@ -48896,6 +48908,11 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 78:  return (long)__macapk_arm64_readlinkat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (char*)macapk_untag_ptr((void*)a3), (size_t)a4);  // readlinkat
         case 79:  return (long)__macapk_arm64_fstatat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (BionicStat*)macapk_untag_ptr((void*)a3), (int)a4);  // fstatat
         case 80:  return (long)__macapk_arm64_fstat((int)a1, (BionicStat*)macapk_untag_ptr((void*)a2));  // fstat
+        // AArch64's __NR_nanosleep uses two LP64 timespec pointers. Darwin's
+        // layout agrees; this router translates host errno once at its boundary.
+        case 101: return (long)::nanosleep(
+                      (const struct timespec*)macapk_untag_ptr((void*)a1),
+                      (struct timespec*)macapk_untag_ptr((void*)a2));
         case 115:  return (long)__macapk_arm64_clock_nanosleep((int)a1, (int)a2, (const struct timespec*)a3, (struct timespec*)macapk_untag_ptr((void*)a4));  // clock_nanosleep
         case 118:  return (long)__macapk_arm64_sched_setparam((pid_t)a1, (const void*)a2);  // sched_setparam
         case 120:  return (long)__macapk_arm64_sched_getscheduler((pid_t)a1);  // sched_getscheduler
@@ -57731,6 +57748,38 @@ bool macapk_range_hits_host_exec(uintptr_t lo, uintptr_t hi) {
 }
 } // namespace
 
+static void macapk_prepare_dynamic_syscalls(void* addr, size_t len, int prot) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("MACAPK_DYNAMIC_SVC_BRK");
+        return e && e[0] == '1';
+    }();
+    // Only a bounded, entirely readable/writable, not-yet-executable region
+    // being published as code. Never write existing executable/host text.
+    if (!enabled || !(prot & PROT_EXEC) || (prot & PROT_WRITE) || !len
+            || len > 1024 * 1024 || (uintptr_t(addr) & 3) || (len & 3)) return;
+    mach_vm_address_t region = reinterpret_cast<uintptr_t>(addr);
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info{};
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size,
+        VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info),
+        &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+    if (kr != KERN_SUCCESS || start < region || start - region > size
+            || len > size - (start - region)
+            || (info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE))
+                != (VM_PROT_READ | VM_PROT_WRITE)) return;
+    size_t changed = macapk::a64::rewrite_dynamic_syscalls(
+        std::span(static_cast<uint32_t*>(addr), len / sizeof(uint32_t)));
+    if (changed) {
+        __builtin___clear_cache(static_cast<char*>(addr), static_cast<char*>(addr) + len);
+        std::fprintf(stderr, "[dynamic-svc] prepared %zu syscall wrapper(s) in %p (%zu bytes)\n",
+                     changed, addr, len);
+    }
+}
+
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     // Guard: the guest must never re-protect OUR host code. If the requested
     // range overlaps a host executable segment we refuse it (report success,
@@ -57776,6 +57825,7 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
         if (t_jit_write_depth == 0) g_jit_write_mtx.lock();
         ++t_jit_write_depth;
     }
+    macapk_prepare_dynamic_syscalls(addr, len, prot);
     int rc = ::mprotect(addr, len, prot);
     // v1.0.586 W^X JIT compat: macOS Apple Silicon forbids PERSISTENT RWX (an
     // mprotect to R+W+X fails). Android JIT engines (cohtml's V8, which renders
