@@ -435,6 +435,14 @@ public final class ClassFileRewriter {
                 }
             }
 
+            // Same-width calls, same operand stack: retain every branch target
+            // and StackMapTable while giving absolute ELF loads a translator.
+            if (containsNeedle(raw, NEEDLE_NATIVE_LOAD)) {
+                for (MethodEntry m : cf.methods) {
+                    if (m.code != null) hits += routeNativeLoads(cf, m.code);
+                }
+            }
+
             if (hits > 0) {
                 byte[] out = cf.serialize();
                 if (DEBUG) {
@@ -585,6 +593,7 @@ public final class ClassFileRewriter {
     // docs/efficiency-classfile-prescan_2026-07-24.md).
     private static final byte[] NEEDLE_CLINIT =
         "<clinit>".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    private static final byte[] NEEDLE_NATIVE_LOAD = {0, 4, 'l', 'o', 'a', 'd'};
 
     /** True if `raw` might match ANY pattern and therefore needs the
      *  full structured parse. See the block comment above for the
@@ -609,7 +618,8 @@ public final class ClassFileRewriter {
                 return true;
             }
             if (containsNeedle(raw, NEEDLE_RUN_FINALIZERS_ON_EXIT)
-                || containsNeedle(raw, FROM_BYTES_G)) {
+                || containsNeedle(raw, FROM_BYTES_G)
+                || containsNeedle(raw, NEEDLE_NATIVE_LOAD)) {
                 return true;
             }
             // Pattern L: a getDeclaredField call AND a libcore field name
@@ -1040,6 +1050,38 @@ public final class ClassFileRewriter {
                 }
                 bc[pc] = (byte) OP_INVOKESTATIC;
                 writeU2(bc, pc + 1, target);
+                routed++;
+            }
+            pc += len;
+        }
+        return routed;
+    }
+
+    // -----------------------------------------------------------------
+    // Absolute native loads, including libraries extracted after Boot.
+    // -----------------------------------------------------------------
+    private static int routeNativeLoads(ClassFile cf, CodeAttr code) {
+        int routed = 0;
+        byte[] bc = code.code;
+        for (int pc = code.codeOffset, end = pc + code.codeLen; pc < end;) {
+            int op = bc[pc] & 0xff;
+            int len = instructionLength(op, bc, pc);
+            if (len <= 0) break;
+            // Earlier rewrites may have appended helper methodrefs (Pattern L).
+            // Their owner is already a bridge, and the original-CP readers
+            // below must not interpret an added entry's synthetic offset.
+            boolean originalCall = (op == OP_INVOKESTATIC || op == OP_INVOKEVIRTUAL)
+                && !cf.cpEntries.get(u2(bc, pc + 1)).added;
+            boolean system = originalCall && op == OP_INVOKESTATIC && isMethodref(cf, u2(bc, pc + 1),
+                "java/lang/System", "load", "(Ljava/lang/String;)V");
+            boolean runtime = originalCall && op == OP_INVOKEVIRTUAL && isMethodref(cf, u2(bc, pc + 1),
+                "java/lang/Runtime", "load", "(Ljava/lang/String;)V");
+            if (system || runtime) {
+                int cls = cf.findOrAddClass("com/macapk/loader/NativeLibraryBridge");
+                int nt = cf.findOrAddNameAndType("load", runtime
+                    ? "(Ljava/lang/Runtime;Ljava/lang/String;)V" : "(Ljava/lang/String;)V");
+                bc[pc] = (byte) OP_INVOKESTATIC;
+                writeU2(bc, pc + 1, cf.findOrAddMethodref(cls, nt));
                 routed++;
             }
             pc += len;

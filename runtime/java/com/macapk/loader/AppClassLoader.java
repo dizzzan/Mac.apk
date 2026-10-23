@@ -1359,6 +1359,11 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
             // fine and then fail every trampoline (br to a null slot ->
             // SIGSEGV), with no chance to recover.
             so = locateApkSo(libname);
+            if (so != null && absoluteLibraryDirs.contains(so.getParentFile())) {
+                synchronized (absoluteLibraryLock) {
+                    return prepareAbsoluteLibrary(so, new java.util.HashSet<>()).getAbsolutePath();
+                }
+            }
 
             // 1. Cache hit -- already translated on a previous boot, AND
             //    (for a Stage-6 arm64 wrapper) its source .so is still
@@ -1761,6 +1766,14 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         if (done.contains(soname) || inProgress.contains(soname)) return;  // done / cycle guard
         File[] info = exposed.get(soname);
         if (info == null) return;   // a system lib we don't bundle -- the loader/host resolves it
+        // A class-resource SoLoader probe can match an app that also uses a
+        // different packed-library loader. Its providers do not exist yet.
+        // Running a dependent's constructors here permanently binds missing
+        // imports to the unresolved trap, before the app can unpack them.
+        if (!dependencyClosureAvailable(info[0], exposed, new java.util.HashSet<>())) {
+            NativeLog.i(TAG, "premap: deferred " + soname + " until its dependencies are available");
+            return;
+        }
         inProgress.add(soname);
         try {
             for (String dep : ElfReader.readDtNeeded(info[0]))
@@ -2327,6 +2340,12 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 // are resolved by the loader's symbol-fallback path.
                 File depSo = locateApkSo(depName);
                 if (depSo == null) continue;
+                if (absoluteLibraryDirs.contains(depSo.getParentFile())) {
+                    synchronized (absoluteLibraryLock) {
+                        linkAbsoluteDependency(prepareAbsoluteLibrary(depSo, new java.util.HashSet<>()));
+                    }
+                    continue;
+                }
                 // Translate + cache the dependency, then dlopen it by
                 // absolute path via Runtime.load. We cannot use
                 // System.loadLibrary here: that uses
@@ -2390,21 +2409,146 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
      *  in which case we fall back to the old behaviour rather than not loading
      *  the library at all. */
     private Class<?> nativeLoaderShim;
+    private final Object nativeLoaderShimLock = new Object();
+
+    private final Object absoluteLibraryLock = new Object();
+    private final java.util.Set<File> absoluteLinkedLibraries = new java.util.HashSet<>();
+    private final java.util.Set<File> absoluteLibraryDirs =
+        new java.util.concurrent.CopyOnWriteArraySet<>();
+
+    /** Called by a rewritten guest System.load/Runtime.load. JNI registration
+     * still happens through a class defined by this loader, after preparing
+     * dependencies. Never hold the preparation lock across JNI_OnLoad. */
+    public void loadAbsoluteLibrary(String path) {
+        java.util.Objects.requireNonNull(path);
+        File source = new File(path);
+        if (!source.isAbsolute()) throw new UnsatisfiedLinkError("Expecting an absolute path of the library: " + path);
+        String target;
+        synchronized (absoluteLibraryLock) {
+            target = prepareAbsoluteLibrary(source, new java.util.HashSet<>()).getAbsolutePath();
+        }
+        loadIntoThisLoader(target);
+    }
+
+    private File prepareAbsoluteLibrary(File source, java.util.Set<File> visiting) {
+        try { source = source.getCanonicalFile(); }
+        catch (IOException e) { throw new UnsatisfiedLinkError(e.toString()); }
+        // Leave host Mach-O libraries and invalid/missing files to HotSpot's
+        // ordinary loader and diagnostics. ELF originals remain untouched.
+        if (!isElf(source)) return source;
+        if (!isArm64Elf(source))
+            throw new UnsatisfiedLinkError("Absolute ELF loading requires AArch64: " + source);
+        if (translatorBin == null || !translatorBin.canExecute())
+            throw new UnsatisfiedLinkError("No translator for ELF library " + source);
+        File installed = nativeLibDir();
+        try { if (installed != null) installed = installed.getCanonicalFile(); }
+        catch (IOException e) { throw new UnsatisfiedLinkError(e.toString()); }
+        boolean inInstallDir = source.getParentFile().equals(installed);
+        if (!inInstallDir) absoluteLibraryDirs.add(source.getParentFile());
+        String key;
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(
+                source.getParent().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            key = java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException e) { throw new AssertionError(e); }
+        File cached = new File(appDir, (inInstallDir ? "lib_native/" : "lib_native/absolute/" + key + "/")
+            + source.getName().replaceFirst("\\.so$", "") + ".dylib");
+        if (!visiting.add(source))
+            throw new UnsatisfiedLinkError("Cyclic ELF dependency at " + source);
+        try {
+            for (String soname : ElfReader.readDtNeeded(source)) {
+                File dep = new File(source.getParentFile(), soname);
+                if (!dep.isFile()) {
+                    dep = installed == null ? null : new File(installed, soname);
+                }
+                if (dep == null || !dep.isFile()) {
+                    for (File dir : absoluteLibraryDirs) {
+                        File candidate = new File(dir, soname);
+                        if (candidate.isFile()) { dep = candidate; break; }
+                    }
+                }
+                if (dep == null || !dep.isFile()) {
+                    if (isPlatformLibrary(soname)) continue;
+                    throw new UnsatisfiedLinkError("Missing ELF dependency " + soname + " of " + source);
+                }
+                File prepared = prepareAbsoluteLibrary(dep, visiting);
+                linkAbsoluteDependency(prepared);
+            }
+            if (!cached.isFile() || !soSourceMatches(cached, source) || !nativeIdMatches(cached)) {
+                cached.getParentFile().mkdirs();
+                if (!translate(source, cached))
+                    throw new UnsatisfiedLinkError("Could not translate " + source);
+                writeNativeIdStamp(cached);
+                writeSoSourceStamp(cached, source);
+            }
+            return cached;
+        } finally { visiting.remove(source); }
+    }
+
+    /** Called under absoluteLibraryLock; pin each dependency only once. */
+    private void linkAbsoluteDependency(File prepared) {
+        if (!absoluteLinkedLibraries.contains(prepared)) {
+            linkDependencyOnly(prepared);
+            absoluteLinkedLibraries.add(prepared);
+        }
+    }
+
+    private static boolean isElf(File source) {
+        try (java.io.InputStream in = new java.io.FileInputStream(source)) {
+            return in.read() == 0x7f && in.read() == 'E' && in.read() == 'L' && in.read() == 'F';
+        } catch (IOException e) { return false; }
+    }
+
+    private static boolean isArm64Elf(File source) {
+        try (java.io.InputStream in = new java.io.FileInputStream(source)) {
+            byte[] header = in.readNBytes(20);
+            return header.length == 20 && header[4] == 2 && header[5] == 1
+                && (header[18] & 0xff) == 183 && header[19] == 0;
+        } catch (IOException e) { return false; }
+    }
+
+    // NDK public system libraries are supplied by the shim/host, not the APK.
+    // libc++_shared is deliberately absent: it is an app-shipped dependency.
+    private static boolean isPlatformLibrary(String soname) {
+        return PLATFORM_LIBRARIES.contains(soname);
+    }
+
+    private static final java.util.Set<String> PLATFORM_LIBRARIES = java.util.Set.of(
+            "libc.so", "libm.so", "libdl.so", "liblog.so",
+            "libandroid.so", "libjnigraphics.so", "libz.so", "libstdc++.so",
+            "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so",
+            "libOpenSLES.so", "libOpenMAXAL.so", "libmediandk.so", "libvulkan.so",
+            "libaaudio.so", "libcamera2ndk.so", "libnativewindow.so", "libsync.so",
+            "libbinder_ndk.so", "libneuralnetworks.so");
+
+    private static boolean dependencyClosureAvailable(File source,
+            java.util.Map<String, File[]> exposed, java.util.Set<File> seen) {
+        if (!seen.add(source)) return true;
+        for (String soname : ElfReader.readDtNeeded(source)) {
+            File[] dep = exposed.get(soname);
+            if (dep == null) {
+                if (!isPlatformLibrary(soname)) return false;
+            } else if (!dependencyClosureAvailable(dep[0], exposed, seen)) return false;
+        }
+        return true;
+    }
 
     private void loadIntoThisLoader(String absPath) {
         try {
-            if (nativeLoaderShim == null) {
-                String res = "com/macapk/loader/NativeLoaderShim.class";
-                java.io.InputStream in =
-                    NativeLoaderShim.class.getClassLoader().getResourceAsStream(res);
-                if (in != null) {
-                    byte[] buf;
-                    try (java.io.InputStream s2 = in) { buf = s2.readAllBytes(); }
-                    // defineClass on THIS loader: same binary name, different
-                    // defining loader, therefore a distinct Class whose
-                    // getClassLoader() is us.
-                    nativeLoaderShim = defineClass(
-                        "com.macapk.loader.NativeLoaderShim", buf, 0, buf.length);
+            synchronized (nativeLoaderShimLock) {
+                if (nativeLoaderShim == null) {
+                    String res = "com/macapk/loader/NativeLoaderShim.class";
+                    java.io.InputStream in =
+                        NativeLoaderShim.class.getClassLoader().getResourceAsStream(res);
+                    if (in != null) {
+                        byte[] buf;
+                        try (java.io.InputStream s2 = in) { buf = s2.readAllBytes(); }
+                        // defineClass on THIS loader: same binary name, different
+                        // defining loader, therefore a distinct Class whose
+                        // getClassLoader() is us.
+                        nativeLoaderShim = defineClass(
+                            "com.macapk.loader.NativeLoaderShim", buf, 0, buf.length);
+                    }
                 }
             }
             if (nativeLoaderShim != null) {
@@ -2413,6 +2557,11 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
                 m.invoke(null, absPath);
                 return;
             }
+        } catch (java.lang.reflect.InvocationTargetException t) {
+            Throwable cause = t.getCause();
+            if (cause instanceof Error error) throw error;
+            if (cause instanceof RuntimeException error) throw error;
+            throw new IllegalStateException("Loading " + absPath, cause);
         } catch (Throwable t) {
             NativeLog.w(TAG, "loadIntoThisLoader(" + absPath + ") failed (" + t
                 + "); falling back to the system-loader path");
@@ -2484,9 +2633,16 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
      *  APK does not ship it for the installed instruction set. */
     private File locateApkSo(String libname) {
         File dir = nativeLibDir();
-        if (dir == null) return null;
-        File candidate = new File(dir, "lib" + libname + ".so");
-        return candidate.exists() ? candidate : null;
+        String name = "lib" + libname + ".so";
+        if (dir != null) {
+            File candidate = new File(dir, name);
+            if (candidate.isFile()) return candidate;
+        }
+        for (File unpacked : absoluteLibraryDirs) {
+            File candidate = new File(unpacked, name);
+            if (candidate.isFile()) return candidate;
+        }
+        return null;
     }
 
     /**
