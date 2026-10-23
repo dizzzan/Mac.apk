@@ -38962,7 +38962,8 @@ static void macapk_note_wrapper_handle(void* h, const std::string& dylib_path) {
     std::lock_guard<std::mutex> lk(macapk_wrapper_handles_mu());
     macapk_wrapper_handles()[h] = base;
 }
-static void* macapk_wrapper_elf_dlsym(void* h, const char* name) {
+static void* macapk_wrapper_elf_dlsym(void* h, const char* name, bool* recognized) {
+    *recognized = false;
     if (!macapk_wrapper_data_dlsym_on()) return nullptr;
     std::string soname;
     {
@@ -38971,6 +38972,7 @@ static void* macapk_wrapper_elf_dlsym(void* h, const char* name) {
         if (it == macapk_wrapper_handles().end()) return nullptr;
         soname = it->second;
     }
+    *recognized = true;
     return __macapk_arm64_native_lookup_latest(soname.c_str(), name);
 }
 
@@ -39193,7 +39195,14 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
             name, p);
         return p;
     }
-    if (void* p = macapk_wrapper_elf_dlsym(handle, name)) return p;
+    bool guest_wrapper = false;
+    void* guest_symbol = macapk_wrapper_elf_dlsym(handle, name, &guest_wrapper);
+    if (guest_symbol) return guest_symbol;
+    // Host wrappers also contain synthetic JNI lifecycle trampolines. A guest
+    // dlsym must report the ELF's actual hooks, including their absence. Other
+    // misses retain the existing lookup through the wrapper's dependencies.
+    if (guest_wrapper && (!std::strcmp(name, "JNI_OnLoad")
+                       || !std::strcmp(name, "JNI_OnUnload"))) return nullptr;
     return dlsym(handle, name);
 }
 

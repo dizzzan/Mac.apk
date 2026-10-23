@@ -15054,6 +15054,21 @@ void* __macapk_arm64_native_dlsym(void* handle, const char* name) {
     return img->lookup(name);
 }
 
+// Wrapper-only lookup preserves ordinary dlsym's missing-symbol result while
+// giving synthesized JNI hook trampolines the defaults specified by JNI.
+// JNI_OnLoad's absence means JNI_VERSION_1_1; absent JNI_OnUnload does no work.
+static int macapk_absent_jni_onload(void*, void*) { return 0x00010001; }
+static void macapk_absent_jni_onunload(void*, void*) {}
+extern "C" void* __macapk_arm64_native_wrapper_dlsym(void* handle, const char* name) {
+    void* entry = __macapk_arm64_native_dlsym(handle, name);
+    if (entry || !handle || !name) return entry;
+    if (!std::strcmp(name, "JNI_OnLoad"))
+        return reinterpret_cast<void*>(&macapk_absent_jni_onload);
+    if (!std::strcmp(name, "JNI_OnUnload"))
+        return reinterpret_cast<void*>(&macapk_absent_jni_onunload);
+    return nullptr;
+}
+
 // --- elfexec (2026-07-29): APK-shipped native EXECUTABLES ------------
 //
 // Android's PackageManager extracts (and chmods 0755) only files matching

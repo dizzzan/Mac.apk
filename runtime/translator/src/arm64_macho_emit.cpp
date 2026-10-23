@@ -581,7 +581,8 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
         adrp_to(8, nameptrs_vmaddr);
         w.push_back(enc_add_imm(8, 8, uint32_t(nameptrs_vmaddr & 0xfff), 0));
         w.push_back(enc_ldr_reg(1, 8, 9));            // ldr x1, [x8, x9, lsl #3]
-        // --- call __macapk_arm64_native_dlsym via __got[1]
+        // --- resolve the initialized ELF export (or absent JNI hook default)
+        //     through __macapk_arm64_native_wrapper_dlsym via __got[1]
         adrp_to(8, got_vmaddr + 8);
         w.push_back(enc_ldr_imm(8, 8, uint32_t((got_vmaddr + 8) & 0xfff)));
         w.push_back(enc_blr(8));
@@ -810,7 +811,7 @@ int emit_arm64_wrapper_dylib(const std::string& out_path,
     const char* bind_names[2] = {
         no_embed ? "___macapk_arm64_native_load_from_path"
                  : "___macapk_arm64_native_load",
-        "___macapk_arm64_native_dlsym",
+        "___macapk_arm64_native_wrapper_dlsym",
     };
     for (int i = 0; i < 2; ++i) {
         bind.u8(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1);                  // 0x11

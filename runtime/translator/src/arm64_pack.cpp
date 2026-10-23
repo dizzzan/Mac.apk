@@ -126,6 +126,14 @@ int run_arm64_pack(const std::string& in_path,
         if (!seen.insert(s.name).second) continue;
         exports.push_back(&s);
     }
+    // Constructors can publish JNI hooks by updating the dynamic symbol table.
+    // ART resolves these hooks after dlopen completes; the on-disk export list
+    // cannot determine whether they will exist then. The wrapper resolver supplies
+    // JNI's absent-hook defaults when the initialized image still has no hook.
+    Symbol64 on_load{"JNI_OnLoad", 0, 0, 1, STT_FUNC};
+    Symbol64 on_unload{"JNI_OnUnload", 0, 0, 1, STT_FUNC};
+    if (seen.insert(on_load.name).second) exports.push_back(&on_load);
+    if (seen.insert(on_unload.name).second) exports.push_back(&on_unload);
     if (verbose) {
         std::fprintf(stderr,
             "[translator] %s: native-arm64 pack -- %zu exports\n",
