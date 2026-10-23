@@ -57944,7 +57944,11 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     // has already been applied), releasing the lock only when this thread's
     // outermost V8 write scope closes. Guarded on depth>0 so an unrelated RX
     // mprotect (a thread not inside a write window) never decrements/unlocks.
-    if (serialize && close_window && t_jit_write_depth > 0) {
+    // A failed opening request did not create a write window. Roll back only
+    // this request's depth, retaining an already-open outer window if present.
+    // Otherwise an invalid address permanently locks out every other thread.
+    if (serialize && t_jit_write_depth > 0
+            && (close_window || (make_writable && rc != 0))) {
         if (--t_jit_write_depth == 0) g_jit_write_mtx.unlock();
     }
     return rc;
