@@ -34,8 +34,12 @@ inline std::vector<InlineDataRange> lr_skipped_ranges(const uint8_t* bytes,
             entries.push_back(pc + sext((w >> 5) & 0x7ffffu, 19) * 4);
         else if ((w & 0x7e000000u) == 0x36000000u)
             entries.push_back(pc + sext((w >> 5) & 0x3fffu, 14) * 4);
-        else if ((w & 0x9f000000u) == 0x10000000u)
-            entries.push_back(pc + sext(((w >> 29) & 3u) | (((w >> 5) & 0x7ffffu) << 2), 21));
+        else if ((w & 0x9f000000u) == 0x10000000u) {
+            uint64_t address = pc + sext(((w >> 29) & 3u) | (((w >> 5) & 0x7ffffu) << 2), 21);
+            // ADR also materializes byte addresses for data reads. An unaligned
+            // address cannot be an AArch64 instruction entry.
+            if (!(address & 3u)) entries.push_back(address);
+        }
 
         if ((w & 0xfc000000u) != 0x94000000u || off + 12 > size) continue;
         uint64_t helper = pc + sext(w & 0x03ffffffu, 26) * 4;

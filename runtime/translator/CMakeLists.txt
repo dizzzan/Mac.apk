@@ -97,6 +97,7 @@ add_library(macapk-bionic-shim SHARED
     # lookup, needed for ARM32 C++ throw/catch). Self-contained TU; see
     # docs/arm32-signal-unwind_2026-07-28.md.
     src/bionic_shim_signal.cpp
+    src/bionic_shim_fallocate.cpp
     # libsigchain semantics for Stage-6 (arm64) guests: guest sigaction/signal
     # for the chained fault signals is RECORDED, not installed, and delivered
     # (with a synthesized Linux siginfo_t + Bionic ucontext_t) only for a fault

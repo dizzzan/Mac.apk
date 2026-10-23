@@ -51,6 +51,7 @@
 
 #include <algorithm>
 #include "a64_inline_data.h"
+#include "a64_shadow_page.h"
 #include <array>
 #include <atomic>
 #include <capstone/capstone.h>  // generic x18 platform-register rewriter
@@ -655,6 +656,8 @@ private:
     // destructor unmaps everything it reserved instead of leaking the pad.
     void*  map_start_ = nullptr;
     size_t map_len_   = 0;
+    uintptr_t svc_shadow_reserve_ = 0;
+    size_t svc_shadow_reserve_size_ = 0, svc_shadow_reserve_used_ = 0;
 
 public:
     // Range accessors for callers (the SEGV handler) that need to
@@ -1120,6 +1123,7 @@ private:
     size_t apply_stack_canary_neutralization();          // replay cache in front of _live
     size_t apply_stack_canary_neutralization_live(size_t* tp_zeroed_out);
     size_t apply_svc_brk_rewrite();
+    size_t apply_svc_shadow_pages();
     size_t apply_raw_syscall_wrapper_redirect();
     size_t apply_midr_el1_neutralization();
     size_t apply_go_tls_rewrite();
@@ -1608,7 +1612,9 @@ bool Image::map_segments(const uint8_t* blob, size_t blob_size, int so_fd) {
 
     // Anonymous RW mapping for the whole span; we'll mprotect per
     // segment later. Reserve the shift pad up front so the image still fits.
-    map_len_ = mapped_size_ + bias_shift;
+    size_t image_reservation = align_up(mapped_size_ + bias_shift, page_size_);
+    if (std::getenv("MACAPK_SYSCALL_TEXT_SHADOW")) svc_shadow_reserve_size_ = page_size_ * 3;
+    map_len_ = image_reservation + svc_shadow_reserve_size_;
     // MACAPK_PAIRIP_HIVA (DIAGNOSTIC, default OFF, 2026-09-12): bias guest ELF loads to the
     // Android high-VA range (~0x7x_________) instead of the macOS-default low VA (~0x1________).
     // Tests the reframe's residual in-scope candidate (docs/pairip-accumulator-oracle-disp6742):
@@ -1657,6 +1663,8 @@ bool Image::map_segments(const uint8_t* blob, size_t blob_size, int so_fd) {
         return false;
     }
     map_start_ = p;
+    if (svc_shadow_reserve_size_)
+        svc_shadow_reserve_ = reinterpret_cast<uintptr_t>(p) + image_reservation;
 
     // base_ is chosen so that "base_ + p_vaddr" yields the runtime
     // address of any virtual address inside the image. Since the
@@ -5570,6 +5578,7 @@ bool Image::load_common() {
         }
     }
     lap("trampoline/x18 finalize + icache");
+    apply_svc_shadow_pages();
     if (!apply_segment_protections())         return false;
     // Strip X from each syscall-wrapper guard page NOW -- after protections, so they are not
     // re-flipped to R-X. Bytes stay pristine (any .text self-hash passes); exec-faults route
@@ -11568,6 +11577,87 @@ bool macapk_setup_syscall_guard_page(uintptr_t wrapper_va, uintptr_t base,
         dbg_name, (unsigned long long)(wrapper_va - base), (unsigned long)page_lo, shadow,
         relocs, ncount);
     return true;
+}
+
+// Diagnostic execution shadows for the register-shuffling syscall wrapper.
+// Run after all text passes: the shadow executes their results, while the SVC
+// words in the original page are restored for ordinary code reads. The guest
+// still executes its own argument/errno adapters; the existing BRK handler
+// services the syscall. No wrapper-entry fast path is used, since callers may
+// enter through a prologue before the register shuffle or fall through to it.
+// This is deliberately opt-in until LR-derived addresses and cross-page
+// indirect transfers have a complete relocation contract.
+extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+size_t Image::apply_svc_shadow_pages() {
+    if (!std::getenv("MACAPK_SYSCALL_TEXT_SHADOW")) return 0;
+    constexpr size_t page_size = 0x4000, allocation_size = page_size * 3;
+    constexpr uint32_t shuffle[] = {0xaa0003e8, 0xaa0103e0, 0xaa0203e1,
+                                    0xaa0303e2, 0xaa0403e3, 0xaa0503e4, 0xaa0603e5};
+    constexpr uint32_t brk = 0xd4200000u | (0x4d41u << 5), svc = 0xd4000001;
+    std::map<uintptr_t, std::vector<uint32_t*>> pages;
+    for (auto sg : segments_) {
+        if (!(sg.prot & PROT_EXEC) || sg.memsz < sizeof(shuffle) + 4) continue;
+        auto* p = reinterpret_cast<uint32_t*>(sg.vaddr);
+        for (size_t i = 7; i < sg.memsz / 4; ++i) {
+            if (p[i] != brk || std::memcmp(p + i - 7, shuffle, sizeof(shuffle))) continue;
+            uintptr_t page = reinterpret_cast<uintptr_t>(p + i) & ~(page_size - 1);
+            if (page < reinterpret_cast<uintptr_t>(base_) ||
+                page + page_size > reinterpret_cast<uintptr_t>(base_) + mapped_size_) continue;
+            pages[page].push_back(p + i);
+        }
+    }
+    size_t count = 0;
+    for (auto& [page, sites] : pages) {
+        if (g_pending_guard_strip_n >= int(std::size(g_pending_guard_strip_lo))) break;
+        std::span<const uint32_t> original(reinterpret_cast<const uint32_t*>(page), page_size / 4);
+        std::vector<uint32_t> relocated;
+        mach_vm_address_t shadow = 0;
+        bool reserved = false;
+        if (svc_shadow_reserve_size_ - svc_shadow_reserve_used_ >= allocation_size) {
+            uintptr_t candidate = svc_shadow_reserve_ + svc_shadow_reserve_used_;
+            if (macapk::a64::relocate_shadow_page(original, page, candidate, relocated)) {
+                shadow = candidate;
+                reserved = true;
+            }
+        }
+        // VM_FLAGS_FIXED fails on occupied pages; it does not replace mappings.
+        // mmap's address is only a hint and commonly lands far outside ADR/LDR
+        // range when an image has JVM mappings on both sides.
+        for (int64_t delta = page_size; delta <= 0xc0000 && !shadow; delta += page_size) {
+            for (int sign : {1, -1}) {
+                mach_vm_address_t candidate = page + sign * delta;
+                if (!macapk::a64::relocate_shadow_page(original, page, candidate, relocated) ||
+                    relocated.size() * 4 > allocation_size) continue;
+                if (mach_vm_allocate(mach_task_self(), &candidate, allocation_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
+                    shadow = candidate;
+                    break;
+                }
+            }
+        }
+        if (!shadow) {
+            std::fprintf(stderr, "[svc-shadow] %s: no free relocatable shadow for page +%#llx\n",
+                         dbg_name_, (unsigned long long)(page - reinterpret_cast<uintptr_t>(base_)));
+            continue;
+        }
+        std::memcpy(reinterpret_cast<void*>(shadow), relocated.data(), relocated.size() * 4);
+        sys_icache_invalidate(reinterpret_cast<void*>(shadow), relocated.size() * 4);
+        if (mprotect(reinterpret_cast<void*>(shadow), allocation_size, PROT_READ | PROT_EXEC) != 0 ||
+            !__macapk_try_set_syscall_guard_page(page, page + page_size, shadow, 0)) {
+            if (reserved) mprotect(reinterpret_cast<void*>(shadow), allocation_size, PROT_READ | PROT_WRITE);
+            else mach_vm_deallocate(mach_task_self(), shadow, allocation_size);
+            continue;
+        }
+        if (reserved) svc_shadow_reserve_used_ += allocation_size;
+        for (uint32_t* site : sites) *site = svc;
+        sys_icache_invalidate(reinterpret_cast<void*>(page), page_size);
+        g_pending_guard_strip_lo[g_pending_guard_strip_n] = page;
+        g_pending_guard_strip_sz[g_pending_guard_strip_n++] = page_size;
+        count += sites.size();
+        std::fprintf(stderr, "[svc-shadow] %s: preserved %zu SVC word(s) on page +%#llx; execution copy=%#llx\n",
+                     dbg_name_, sites.size(), (unsigned long long)(page - reinterpret_cast<uintptr_t>(base_)),
+                     (unsigned long long)shadow);
+    }
+    return count;
 }
 
 // ---------------------------------------------------------------------------

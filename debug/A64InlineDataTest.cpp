@@ -73,5 +73,7 @@ int main() {
     // An incoming edge at the high endpoint is outside the skipped interval.
     c = fixture(); c[16] = 0x17ffffff;
     check(contains(c, 0x10), "incoming edge at destination is safe");
+    c = fixture(); c[16] = 0x30fffe80; // ADR x0,0x11
+    check(contains(c, 0x10), "unaligned data address is not an instruction entry");
     std::printf("%d inline-data checks passed\n", checks);
 }

@@ -380,7 +380,16 @@ public final class BinaryXmlParser {
         int dataType = u8(a + 15);
         int data     = i32(a + 16);
 
+        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String name = poolStr(nameIdx);
+        // Compiled XML can erase attribute-name strings and retain their
+        // resource-map IDs. Android consumes those IDs directly. DOM consumers
+        // need the corresponding attr name, including ordinary layout attrs
+        // outside the small manifest-only fallback table below.
+        if (name.isEmpty() && attrId != 0 && names != null) {
+            String resolved = names.typeName(attrId);
+            if (resolved != null && resolved.startsWith("attr/")) name = resolved.substring(5);
+        }
         if (name.isEmpty() && nameIdx >= 0 && nameIdx < resourceMap.length) {
             String known = WELL_KNOWN_ATTRS.get(resourceMap[nameIdx]);
             if (known != null) name = known;
@@ -390,7 +399,6 @@ public final class BinaryXmlParser {
         // The attr this value is assigned to (the resource map pairs each
         // attribute-name string with the attr's resource id) -- what the
         // enum/flag symbol tables are keyed by.
-        int attrId = (nameIdx >= 0 && nameIdx < resourceMap.length) ? resourceMap[nameIdx] : 0;
         String value;
         String typeTag;
         switch (dataType) {

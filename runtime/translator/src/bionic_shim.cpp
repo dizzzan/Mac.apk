@@ -2590,13 +2590,15 @@ struct MacapkSyscallGuard { uintptr_t lo, hi, shadow, wrapper; };
 static MacapkSyscallGuard g_sc_guards[8];
 static std::atomic<int>   g_sc_guard_n{0};
 extern "C" long __macapk_arm64_raw_syscall(long, long, long, long, long, long, long);
-extern "C" void __macapk_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
-                                                uintptr_t shadow_base, uintptr_t wrapper_va) {
+extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
+                                                    uintptr_t shadow_base, uintptr_t wrapper_va) {
+    static std::mutex registration_mutex;
+    std::lock_guard<std::mutex> lock(registration_mutex);
     int n = g_sc_guard_n.load(std::memory_order_relaxed);
-    for (int i = 0; i < n; ++i) if (g_sc_guards[i].lo == page_lo) return;   // already registered
+    for (int i = 0; i < n; ++i) if (g_sc_guards[i].lo == page_lo) return false;
     if (n >= (int)(sizeof(g_sc_guards) / sizeof(g_sc_guards[0]))) {
         std::fprintf(stderr, "[guard] table full (%d entries) -- page %#lx NOT guarded\n",
-                     n, (unsigned long)page_lo); std::fflush(stderr); return;
+                     n, (unsigned long)page_lo); std::fflush(stderr); return false;
     }
     g_sc_guards[n] = { page_lo, page_hi, shadow_base, wrapper_va };
     g_sc_guard_n.store(n + 1, std::memory_order_release);   // publish after the slot is filled
@@ -2604,6 +2606,11 @@ extern "C" void __macapk_set_syscall_guard_page(uintptr_t page_lo, uintptr_t pag
                  n, (unsigned long)page_lo, (unsigned long)page_hi,
                  (unsigned long)shadow_base, (unsigned long)wrapper_va);
     std::fflush(stderr);
+    return true;
+}
+extern "C" void __macapk_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
+                                                uintptr_t shadow_base, uintptr_t wrapper_va) {
+    (void)__macapk_try_set_syscall_guard_page(page_lo, page_hi, shadow_base, wrapper_va);
 }
 static bool macapk_syscall_guard_fault(ucontext_t* uc, uintptr_t pc) {
     int n = g_sc_guard_n.load(std::memory_order_acquire);
@@ -14508,9 +14515,11 @@ static void macapk_svc_brk_sigtrap(int sig, siginfo_t* info, void* ucontext) {
                     ret = 0;
                     break;
                 default:
-                    // BRK preserved x8 + x0..x5, so a full by-number emulation is
-                    // correct here (unlike the SIGSYS path where XNU clobbered x0).
-                    ret = __macapk_arm64_syscall(nr, (long)ss.__x[0], (long)ss.__x[1],
+                    // This replaces a kernel instruction, so failure must be
+                    // -Linux_errno and must not change the interrupted errno.
+                    // The libc face returns -1, which a guest's own errno
+                    // adapter would incorrectly decode as EPERM for every error.
+                    ret = __macapk_arm64_raw_syscall(nr, (long)ss.__x[0], (long)ss.__x[1],
                         (long)ss.__x[2], (long)ss.__x[3], (long)ss.__x[4], (long)ss.__x[5]);
                     break;
             }
