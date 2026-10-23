@@ -47917,6 +47917,34 @@ extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset);
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot);
 extern "C" int __macapk_arm64_madvise(void* addr, size_t len, int advice);
+
+// Both ABIs use one byte per host page and bit zero for residency. Unlike
+// Linux mm/mincore.c, Darwin permits unaligned starts and reports holes as
+// non-resident. Validate Linux's alignment and mapping contract first.
+extern "C" int __macapk_arm64_mincore(void* addr, size_t length, unsigned char* vec) {
+    uintptr_t start = uintptr_t(macapk_untag_ptr(addr));
+    const size_t page = (size_t)::sysconf(_SC_PAGESIZE);
+    if (start & (page - 1)) { errno = EINVAL; return -1; }
+    if (length > UINTPTR_MAX - start) { errno = ENOMEM; return -1; }
+    if (!length) return 0;
+    uintptr_t end = start + length;
+    for (uintptr_t cursor = start; cursor < end;) {
+        mach_vm_address_t region = cursor;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        kern_return_t kr = mach_vm_region(mach_task_self(), &region, &size,
+            VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info),
+            &count, &object);
+        if (object) mach_port_deallocate(mach_task_self(), object);
+        if (kr != KERN_SUCCESS || region > cursor || !size || region + size <= cursor) {
+            errno = ENOMEM; return -1;
+        }
+        cursor = region + size;
+    }
+    return ::mincore(reinterpret_cast<void*>(start), length, reinterpret_cast<char*>(vec));
+}
 extern "C" int __macapk_arm64_libunity_munmap(void* addr, size_t length);
 
 // AArch64 pselect6's last argument is {sigset pointer, size}, unlike libc's
@@ -49010,6 +49038,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 215:  return (long)__macapk_arm64_libunity_munmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2);
         case 222:  return (long)__macapk_arm64_mmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3, (int)a4, (int)a5, (off_t)a6);  // mmap
         case 226:  return (long)__macapk_arm64_mprotect((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // mprotect
+        case 232:  return __macapk_arm64_mincore((void*)a1, (size_t)a2, (unsigned char*)a3);
         case 233:  return (long)__macapk_arm64_madvise((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // madvise
         case 279:  // SYS_memfd_create (name=a1, flags=a2). memfd_create is new
                    // enough that callers invoke it via raw syscall() rather than a
