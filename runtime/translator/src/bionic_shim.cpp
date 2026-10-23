@@ -29,6 +29,7 @@
 #include <cstring>
 #include "native_window_pixels.h"
 #include "a64_dynamic_syscall.h"
+#include "fault_wx_pages.h"
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
@@ -3203,8 +3204,37 @@ static void macapk_fatal_reraise(int sig) {
     raise(sig);
 }
 
+// Diagnostic compatibility for guest anonymous code that requests persistent RWX.
+// XNU receives only RW or RX; the faulting instruction retries after a switch.
+static const bool g_fault_wx_on = [] {
+    const char* v = std::getenv("MACAPK_JIT_FAULT_WX"); return v && v[0] == '1';
+}();
+static macapk::FaultWxPages g_fault_wx_pages;
+static void macapk_prepare_dynamic_syscalls(void*, size_t, int);
+static bool macapk_fault_wx_handle(void* context) {
+    if (!g_fault_wx_on || !context) return false;
+    auto* uc = static_cast<ucontext_t*>(context);
+    if (!uc->uc_mcontext) return false;
+    auto& mc = *uc->uc_mcontext;
+    uint32_t ec = mc.__es.__esr >> 26;
+    bool execute = ec == 0x20 || ec == 0x21;
+    bool write_fault = (ec == 0x24 || ec == 0x25) && (mc.__es.__esr & (1u << 6));
+    uintptr_t address = execute ? mc.__ss.__pc : mc.__es.__far;
+    if ((!execute && !write_fault) || !g_fault_wx_pages.contains(address)) return false;
+    void* page = reinterpret_cast<void*>(address & ~(uintptr_t(0x4000) - 1));
+    int saved_errno = errno;
+    if (execute) {
+        macapk_prepare_dynamic_syscalls(page, 0x4000, PROT_READ | PROT_EXEC);
+        __builtin___clear_cache(static_cast<char*>(page), static_cast<char*>(page) + 0x4000);
+    }
+    int rc = ::mprotect(page, 0x4000, PROT_READ | (execute ? PROT_EXEC : PROT_WRITE));
+    errno = saved_errno;
+    return rc == 0;
+}
+
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 #if defined(__APPLE__) && defined(__aarch64__)
+    if (macapk_fault_wx_handle(ucontext)) return;
     // pairip resolver guard (FIRST -- cheapest, and a fault here is expected): a fault
     // while a resolver program is running is its self-verify detonation. Unwind back to
     // __macapk_pairip_run_resolver, which returns as if the resolver completed (its GOT
@@ -57459,7 +57489,17 @@ static inline int macapk_bionic_to_mac_mmap_flags(int lin) {
 extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset) {
     int mac_flags = macapk_bionic_to_mac_mmap_flags(flags);
-    void* p = mmap(addr, length, prot, mac_flags, fd, offset);
+    const bool fault_wx = g_fault_wx_on && (mac_flags & MAP_ANON)
+        && prot == (PROT_READ | PROT_WRITE | PROT_EXEC);
+    void* p = mmap(addr, length, fault_wx ? (PROT_READ | PROT_WRITE) : prot,
+                   mac_flags, fd, offset);
+    if (p != MAP_FAILED && g_fault_wx_on) {
+        // MAP_FIXED replaces an earlier mapping and its logical permissions.
+        if (mac_flags & MAP_FIXED) g_fault_wx_pages.remove(uintptr_t(p), length);
+        if (fault_wx && !g_fault_wx_pages.add(uintptr_t(p), length)) {
+            ::munmap(p, length); p = MAP_FAILED; errno = ENOMEM;
+        }
+    }
     // Low-volume diagnostic: first calls + every failure. The GC grows
     // its heap with many mmaps; logging the result address also lets us
     // confirm whether il2cpp tolerates the (possibly high) addresses
@@ -57687,7 +57727,9 @@ extern "C" int __macapk_arm64_libunity_munmap(void* addr, size_t length) {
     // munmap, so a later mmap that reuses the address does not inherit a stale
     // prefault/swallow range.
     macapk_libunity_arena::deregister_reserve(addr);
-    return ::munmap(addr, length);
+    int rc = ::munmap(addr, length);
+    if (rc == 0 && g_fault_wx_on) g_fault_wx_pages.remove(uintptr_t(addr), length);
+    return rc;
 }
 
 // mprotect shim (auto-bound via __macapk_arm64_<name>; applies to every
@@ -57863,15 +57905,25 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     // drops WRITE while keeping EXEC (V8's "done writing, make it runnable" = RX).
     const bool make_writable = (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC);
     const bool close_window  = (prot & PROT_EXEC) && !(prot & PROT_WRITE);
-    const bool serialize     = macapk_jit_serialize_on();
+    const bool serialize     = macapk_jit_serialize_on() && !g_fault_wx_on;
     // Open the write window BEFORE the page becomes writable, so a sibling
     // compiler thread cannot be reprotecting the same host page concurrently.
     if (serialize && make_writable) {
         if (t_jit_write_depth == 0) g_jit_write_mtx.lock();
         ++t_jit_write_depth;
     }
+    // With fault-mediated W^X enabled, RWX denotes a logical permission.
+    // Register before publishing RW so another executing thread can fault safely.
+    bool fault_wx = g_fault_wx_on && prot == (PROT_READ | PROT_WRITE | PROT_EXEC)
+        && addr && !(uintptr_t(addr) & (macapk::FaultWxPages::kPage - 1)) && len;
+    if (fault_wx && !g_fault_wx_pages.add(uintptr_t(addr), len)) {
+        errno = ENOMEM;
+        return -1;
+    }
     macapk_prepare_dynamic_syscalls(addr, len, prot);
-    int rc = ::mprotect(addr, len, prot);
+    int rc = ::mprotect(addr, len, fault_wx ? (PROT_READ | PROT_WRITE) : prot);
+    if (g_fault_wx_on && ((rc == 0 && !make_writable) || (rc != 0 && fault_wx)))
+        g_fault_wx_pages.remove(uintptr_t(addr), len);
     // v1.0.586 W^X JIT compat: macOS Apple Silicon forbids PERSISTENT RWX (an
     // mprotect to R+W+X fails). Android JIT engines (cohtml's V8, which renders
     // MCPE's Ore-UI menu) request RWX to UNPROTECT a code page for writing --
