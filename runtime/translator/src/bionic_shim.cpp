@@ -70,6 +70,7 @@
 #include <setjmp.h>        // sigsetjmp / siglongjmp for SEGV recovery
 #include <signal.h>        // sigaction
 #include <sys/mman.h>      // mmap for the guest memory region
+#include <sys/select.h>
 #include <poll.h>          // poll() for ALooper_addFd fd-monitoring (Unity vsync)
 #include <fcntl.h>         // pipe wake-fd (Java<->native Looper unification)
 #include <netdb.h>         // getaddrinfo (il2cpp DNS PAL)
@@ -47886,6 +47887,45 @@ extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
                                         int flags, int fd, off_t offset);
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot);
 extern "C" int __macapk_arm64_madvise(void* addr, size_t len, int advice);
+extern "C" int __macapk_arm64_libunity_munmap(void* addr, size_t length);
+
+// AArch64 pselect6's last argument is {sigset pointer, size}, unlike libc's
+// pselect. fd_set is the same 1024-bit, little-endian bit array on Bionic LP64
+// and Darwin (AOSP libc/include/sys/select.h). Serve the ordinary no-mask wait;
+// a non-null mask needs signal-number translation and must fail honestly until
+// that is implemented. Linux's raw syscall also writes the remaining timeout.
+static long macapk_pselect6_host(int nfds, fd_set* readfds, fd_set* writefds,
+        fd_set* exceptfds, struct timespec* timeout, const void* maskarg) {
+    if (nfds < 0 || nfds > FD_SETSIZE) { errno = EINVAL; return -1; }
+    if (maskarg) {
+        uintptr_t pair[2]{}; mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), uintptr_t(maskarg), sizeof(pair),
+                reinterpret_cast<mach_vm_address_t>(pair), &got) != KERN_SUCCESS
+                || got != sizeof(pair)) { errno = EFAULT; return -1; }
+        if (pair[0]) { errno = EOPNOTSUPP; return -1; }
+    }
+    struct timespec requested{}, start{}, end{};
+    if (timeout) {
+        requested = *timeout;
+        if (requested.tv_sec < 0 || requested.tv_nsec < 0 || requested.tv_nsec >= 1000000000) {
+            errno = EINVAL; return -1;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &start);
+    }
+    int rc = ::pselect(nfds, readfds, writefds, exceptfds,
+                        timeout ? &requested : nullptr, nullptr);
+    int saved_errno = errno;
+    if (timeout && (rc >= 0 || saved_errno == EINTR)) {
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        __int128 remaining = __int128(requested.tv_sec) * 1000000000 + requested.tv_nsec
+            - (__int128(end.tv_sec - start.tv_sec) * 1000000000 + end.tv_nsec - start.tv_nsec);
+        if (remaining < 0) remaining = 0;
+        timeout->tv_sec = time_t(remaining / 1000000000);
+        timeout->tv_nsec = long(remaining % 1000000000);
+    }
+    errno = saved_errno;
+    return rc;
+}
 extern "C" ssize_t __macapk_arm64_process_vm_readv(
         pid_t /*pid*/, const void* /*lvec*/, unsigned long /*lcnt*/,
         const void* /*rvec*/, unsigned long /*rcnt*/, unsigned long /*flags*/);
@@ -48905,6 +48945,10 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
                   return (long)macapk_write_host((int)a1, (const void*)macapk_untag_ptr((void*)a2), (size_t)a3);  // write
         case 67:  return (long)::pread((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3, (off_t)a4);  // pread64
         case 68:  return (long)::pwrite((int)a1, (const void*)a2, (size_t)a3, (off_t)(int64_t)a4);  // pwrite64
+        case 72:  return macapk_pselect6_host((int)a1,
+                      (fd_set*)macapk_untag_ptr((void*)a2), (fd_set*)macapk_untag_ptr((void*)a3),
+                      (fd_set*)macapk_untag_ptr((void*)a4), (struct timespec*)macapk_untag_ptr((void*)a5),
+                      macapk_untag_ptr((void*)a6));
         case 78:  return (long)__macapk_arm64_readlinkat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (char*)macapk_untag_ptr((void*)a3), (size_t)a4);  // readlinkat
         case 79:  return (long)__macapk_arm64_fstatat((int)a1, (const char*)macapk_untag_ptr((void*)a2), (BionicStat*)macapk_untag_ptr((void*)a3), (int)a4);  // fstatat
         case 80:  return (long)__macapk_arm64_fstat((int)a1, (BionicStat*)macapk_untag_ptr((void*)a2));  // fstat
@@ -48933,6 +48977,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 208:  return macapk_router_from_linux((long)__macapk_arm64_setsockopt((int)a1, (int)a2, (int)a3, (const void*)a4, (socklen_t)a5));  // setsockopt
         case 209:  return macapk_router_from_linux((long)__macapk_arm64_getsockopt((int)a1, (int)a2, (int)a3, (void*)macapk_untag_ptr((void*)a4), (socklen_t*)a5));  // getsockopt
         case 216:  return (long)__macapk_arm64_mremap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (size_t)a3, (int)a4);  // mremap
+        case 215:  return (long)__macapk_arm64_libunity_munmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2);
         case 222:  return (long)__macapk_arm64_mmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3, (int)a4, (int)a5, (off_t)a6);  // mmap
         case 226:  return (long)__macapk_arm64_mprotect((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // mprotect
         case 233:  return (long)__macapk_arm64_madvise((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // madvise
