@@ -1390,6 +1390,7 @@ struct EnvEditor: View {
     @State private var text: String = ""
     @State private var problems: [String] = []
     @State private var loaded: Bool = false
+    @State private var baseline: [String: String] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1420,14 +1421,30 @@ struct EnvEditor: View {
         .onAppear {
             // Only seed once: re-seeding on every re-render would stomp
             // whatever the user has typed but not applied.
-            if !loaded { text = Self.text(from: env); loaded = true }
+            if !loaded { baseline = env; text = Self.text(from: env); loaded = true }
+        }
+        .onChange(of: env) { oldValue, newValue in
+            // Compatibility controls edit the same saved dictionary. Keep a
+            // clean editor current; preserve an unapplied handwritten draft.
+            if text == Self.text(from: oldValue) {
+                baseline = newValue
+                text = Self.text(from: newValue)
+            }
         }
     }
 
     private func apply() {
         let parsed = Self.parse(text)
         problems = parsed.problems
-        env = parsed.env
+        var merged = parsed.env
+        // Preserve concurrent changes to keys the user did not edit in the
+        // draft (including a preset selected while the draft was open).
+        for key in Set(baseline.keys).union(env.keys) where parsed.env[key] == baseline[key] {
+            merged[key] = env[key]
+        }
+        baseline = merged
+        text = Self.text(from: merged)
+        env = merged
     }
 
     static func text(from env: [String: String]) -> String {
