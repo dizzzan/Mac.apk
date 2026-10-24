@@ -168,6 +168,8 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         this.translatorBin   = translatorBin;
         this.apkSet          = InstalledSplits.of(apkPath);
         this.apkFile         = apkSet.isEmpty() ? null : apkSet.get(0);
+        if (this.apkFile != null && urls.length > 0)
+            macapkRegisterInstalledDex(this.apkFile, urls[0]);
         this.apkZips         = new java.util.zip.ZipFile[apkSet.size()];
         this.apkZipFailed    = new boolean[apkSet.size()];
     }
@@ -767,7 +769,10 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // it carries the entry -- the SAME entry, through the same kind of
         // JarFile, that the URL lookup below would resolve. See
         // BOOTSPEED_JARREAD. A miss (or any trouble) takes the unchanged URL path.
-        byte[] direct = BOOTSPEED_JARREAD ? readClassJarEntry(resourcePath) : null;
+        // A split/hotfix installer can prepend or remove code paths. The
+        // original-jar shortcut is only valid before such an edit.
+        boolean modifiedDexPath = macapkHasModifiedDexPath();
+        byte[] direct = BOOTSPEED_JARREAD && !modifiedDexPath ? readClassJarEntry(resourcePath) : null;
         java.net.URL u = direct != null ? null : findResource(resourcePath);
         if (direct != null || u != null) {
             try (java.io.InputStream in = direct != null ? null : u.openStream()) {
@@ -817,7 +822,7 @@ public final class AppClassLoader extends dalvik.system.PathClassLoader {
         // eager behaviour is byte-for-byte unchanged. Bytes still go through
         // ClassFileRewriter -- the interception point is the same one the
         // eager path uses, so a rewrite fix applies to both.
-        dalvik.system.LazyDexSource lazy = lazySource();
+        dalvik.system.LazyDexSource lazy = modifiedDexPath ? null : lazySource();
         if (lazy != null) {
             byte[] raw = remapRewrite(lazy.classBytes(srcDotted.replace('.', '/')));
             if (raw != null) {

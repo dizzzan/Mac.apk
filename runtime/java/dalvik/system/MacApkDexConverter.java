@@ -99,6 +99,41 @@ final class MacApkDexConverter {
 
     private MacApkDexConverter() {}
 
+    // Boot has already validated and converted the installed APK (and its
+    // splits). SplitCompat may ask to add that same APK again. Converting it
+    // inside the app JVM can exhaust its smaller heap even though the startup
+    // converter succeeded in a separate process. Reuse only the registered
+    // source while its identity and metadata still match.
+    private static final Map<Path, Map.Entry<java.nio.file.attribute.BasicFileAttributes, URL>>
+            INSTALLED_SOURCES = new ConcurrentHashMap<>();
+
+    static void registerInstalledSource(File source, URL jar) {
+        try {
+            Path path = source.toPath().toRealPath();
+            if (!"file".equals(jar.getProtocol()) || !isValidJar(Path.of(jar.toURI()))) return;
+            INSTALLED_SOURCES.put(path, Map.entry(Files.readAttributes(path,
+                    java.nio.file.attribute.BasicFileAttributes.class), jar));
+        } catch (Exception ignored) { }
+    }
+
+    private static URL installedJar(File source) {
+        try {
+            Path path = source.toPath().toRealPath();
+            var entry = INSTALLED_SOURCES.get(path);
+            if (entry == null) return null;
+            var before = entry.getKey();
+            var now = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class);
+            if (before.size() == now.size() && before.lastModifiedTime().equals(now.lastModifiedTime())
+                    && java.util.Objects.equals(before.fileKey(), now.fileKey())
+                    && isValidJar(Path.of(entry.getValue().toURI()))) {
+                System.err.println("[macapk] dyn dex: reusing installed conversion for " + source);
+                return entry.getValue();
+            }
+            INSTALLED_SOURCES.remove(path, entry);
+        } catch (Exception ignored) { }
+        return null;
+    }
+
     /** Thrown when the DEX cannot be converted. Callers map this to a faithful
      *  runtime failure (the on-device path would also throw if the DEX could
      *  not be opened). */
@@ -181,6 +216,8 @@ final class MacApkDexConverter {
      *  re-open it. Otherwise it is ephemeral, exactly like in-memory output.
      *  Never returns null; throws on failure. */
     static URL convertFileToJarUrl(File input) {
+        URL installed = installedJar(input);
+        if (installed != null) return installed;
         List<byte[]> images;
         try {
             // The same reader Main.run(Path, Path) uses, so the image set --
