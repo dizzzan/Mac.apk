@@ -299,6 +299,26 @@ diagnosis. Comparison with the owner's working emulator and Clapper version is
 still needed. Private inspection agents, app bytecode, account data and logs
 remain outside this repository.
 
+### User-selected display identity / API 34 experiment (2026-10-24)
+
+At the owner's request, the local Clapper launcher now selects the Galaxy A52
+labels (`samsung`, `samsung`, `SM-A525F`) and Android 14/API 34. The generic
+optional label variables are documented in [DEVICE_IDENTITY.md](DEVICE_IDENTITY.md).
+The shared execution profile does not select them, and the TikTok bundle/data
+were not changed. This does not suppress Clapper's warning handler or change
+hardware capability flags.
+
+The Java build and 13 fresh-JVM identity/initialization runs pass. A read-only
+JNI probe in the running app confirmed identical Java/native model, manufacturer,
+brand, fingerprint and Android version. The feed, authenticated test profile and
+Live activity open. The cached legacy emulator result remains true; the initial
+new room had no active mask, which alone does not establish a warning fix.
+The owner's multi-stream check is pending.
+
+The preceding API 36 session also ended after about 18 minutes in a native
+`liteav_video_decoder` SIGSEGV, with the same guest stack as an earlier SIGBUS.
+This is a remaining stability issue, not evidence of an API 34 improvement.
+
 ### Native runtime hardening
 
 Execution copies remain opt-in. Before upstream submission, improve concurrent

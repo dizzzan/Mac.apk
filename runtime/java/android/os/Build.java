@@ -22,7 +22,7 @@ public class Build {
     public static final String UNKNOWN     = "unknown";
     public static final String BOARD       = "macapk";
     public static final String BOOTLOADER  = "unknown";
-    public static final String BRAND       = "Mac.apk";
+    public static final String BRAND       = macapkIdentity("BRAND", "Mac.apk");
     public static final String CPU_ABI     = "arm64-v8a";
     public static final String CPU_ABI2    = "";
     public static final String[] SUPPORTED_ABIS    = { "arm64-v8a" };
@@ -39,13 +39,40 @@ public class Build {
     // who an app should be told it is running on. Corrected
     // 2026-08-20 at the owner's direction. Not part of FINGERPRINT, which
     // derives from BRAND/PRODUCT/DEVICE, so nothing else moves.
-    public static final String MANUFACTURER = "Voltare";
-    public static final String MODEL       = "Mac.apk";
+    public static final String MANUFACTURER = macapkIdentity("MANUFACTURER", "Voltare");
+    public static final String MODEL       = macapkIdentity("MODEL", "Mac.apk");
     public static final String PRODUCT     = "macapk";
     public static final String RADIO       = "unknown";
     public static final String TAGS        = "release-keys";
     public static final String TYPE        = "user";
     public static final String USER        = "macapk";
+
+    // AOSP Build reads these labels once from ro.product.* at class initialization
+    // (frameworks/base/core/java/android/os/Build.java). Mac.apk owns that store,
+    // so optional launch-time labels originate here and SystemProperties mirrors
+    // them to Java and native callers. Do not read SystemProperties here: its
+    // initializer reads Build and would create a partially initialized map.
+    // Method initialization also prevents javac from inlining the default label
+    // into framework callers. No SDK, feature, serial or attestation changes.
+    private static String macapkIdentity(String field, String fallback) {
+        String value;
+        try { value = System.getenv("MACAPK_DEVICE_" + field); }
+        catch (SecurityException denied) { return fallback; }
+        if (value == null || (value = value.trim()).isEmpty()) return fallback;
+        // Keep the native 92-byte property buffer and derived fingerprint intact.
+        // Brand is a fingerprint component; model/manufacturer may contain spaces.
+        if ("BRAND".equals(field) && !value.matches("[A-Za-z0-9._-]{1,32}")) return fallback;
+        int bytes = 0;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (Character.isISOControl(c)) return fallback;
+            // NativeCocoa's property bridge uses JNI modified UTF-8: each half
+            // of a supplementary character occupies three bytes in that store.
+            bytes += c <= 0x7f ? 1 : c <= 0x7ff ? 2 : 3;
+            if (bytes > 91) return fallback;
+        }
+        return value;
+    }
 
     // ⚠ v1.0.938: DERIVED from the fields below, not spelled independently.
     // It used to read "macapk/v2/arm64-v8a:.../PR1/0:user/release-keys", which
@@ -57,9 +84,8 @@ public class Build {
     // so a real device cannot contradict itself here. Apps parse this string
     // and compare components against the individual fields; a mismatch is the
     // kind of thing that makes a device-detect heuristic take a branch nobody
-    // tested. This does NOT change any identity value -- every component still
-    // says what we already said elsewhere -- and it deliberately does NOT match
-    // the emulator's fingerprint, which would be claiming to be a Google device.
+    // tested. Keep deriving it when a launch-time brand label is selected, so
+    // Build, SystemProperties and the system partition agree on every component.
     public static final String FINGERPRINT =
         BRAND + "/" + PRODUCT + "/" + DEVICE + ":" + VERSION.RELEASE
         + "/" + ID + "/" + VERSION.INCREMENTAL + ":" + TYPE + "/" + TAGS;
