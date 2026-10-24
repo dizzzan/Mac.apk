@@ -122,7 +122,10 @@ public final class HostUrlIntake {
 
     /** RFC 3986 section 3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). */
     static boolean validScheme(String s) {
-        if (s == null || s.isEmpty() || s.length() > 64) return false;
+        // OAuth callbacks commonly use reverse-domain client IDs longer than
+        // 64 characters. The URI grammar has no such length limit; rejecting
+        // them here drops a valid manifest filter from host registration.
+        if (s == null || s.isEmpty()) return false;
         char c0 = s.charAt(0);
         if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z'))) return false;
         for (int i = 1; i < s.length(); i++) {
