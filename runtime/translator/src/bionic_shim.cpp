@@ -45543,6 +45543,40 @@ extern "C" ssize_t __macapk_arm64_pwrite64(int fd, const void* buf,
 extern "C" int __macapk_arm64_ftruncate64(int fd, int64_t length) {
     return ::ftruncate(fd, (off_t)length);
 }
+// posix_fallocate returns an error number and preserves errno, unlike fallocate.
+// Reserve real blocks before extending EOF; ftruncate alone creates a sparse
+// file and cannot provide the promised protection against later ENOSPC errors.
+extern "C" int __macapk_arm64_posix_fallocate(int fd, int64_t offset, int64_t length) {
+    const int saved_errno = errno;
+    const int error = [&]() -> int {
+        if (offset < 0 || length <= 0) return EINVAL;
+        if (offset > INT64_MAX - length) return EFBIG;
+        const int flags = ::fcntl(fd, F_GETFL);
+        if (flags < 0) return errno;
+        if ((flags & O_ACCMODE) == O_RDONLY) return EBADF;
+        struct stat st{};
+        if (::fstat(fd, &st) != 0) return errno;
+        if (!S_ISREG(st.st_mode)) return S_ISFIFO(st.st_mode) ? ESPIPE : ENODEV;
+        const off_t end = offset + length;
+        const off_t allocated = st.st_blocks * 512;
+        const off_t capacity = std::max(end, st.st_size);
+        if (allocated < capacity) {
+            fstore_t store{};
+            store.fst_flags = F_ALLOCATEALL;
+            store.fst_posmode = F_PEOFPOSMODE;
+            // F_PEOFPOSMODE's length is additional capacity, not final size.
+            store.fst_length = capacity - allocated;
+            if (::fcntl(fd, F_PREALLOCATE, &store) != 0) return errno;
+        }
+        if (end > st.st_size && ::ftruncate(fd, end) != 0) return errno;
+        return 0;
+    }();
+    errno = saved_errno;
+    return errno_mac2lin(error);
+}
+extern "C" int __macapk_arm64_posix_fallocate64(int fd, int64_t offset, int64_t length) {
+    return __macapk_arm64_posix_fallocate(fd, offset, length);
+}
 // __pread64_chk -- FORTIFY variant of pread64. bionic aborts when
 // count > buf_size; we log and clamp (lenient mode, matching the rest
 // of the shim) so a benign over-read can't take down boot.
