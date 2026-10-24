@@ -334,27 +334,10 @@ public class Resources {
     }
 
     public String getString(int id) {
-        // Route through the apktool-decoded values/strings.xml index
-        // when one is attached. Returning the actual string value is
-        // required by SDKs that look up config via getIdentifier +
-        // getString -- most prominently FirebaseOptions.fromResource,
-        // which reads google_app_id / google_api_key / project_id /
-        // gcm_defaultSenderId / firebase_database_url to build a
-        // FirebaseOptions. Without these, FirebaseApp.initializeApp()
-        // logs "Default FirebaseApp failed to initialize because no
-        // default options were found" and every later Firebase API
-        // call throws IllegalStateException -- which is what blocks
-        // cocos2d-x apps that touch Firebase Analytics during Activity
-        // onCreate (the empty std::string -> fopen("") chain).
-        if (macapkResourceIndex != null) {
-            try {
-                java.lang.reflect.Method m = macapkResourceIndex.getClass()
-                    .getMethod("stringForId", int.class);
-                Object v = m.invoke(macapkResourceIndex, id);
-                if (v instanceof String) return (String) v;
-            } catch (Throwable ignored) {}
-        }
-        return "";
+        // AOSP dispatches string -> text. The opposite direction recurses when
+        // a localized Resources wrapper implements getString via getText and
+        // delegates getText back to super.
+        return getText(id).toString();
     }
     // AOSP getString(int, Object...) -- looks up the string then runs it
     // through String.format with the supplied args. Common for any localized
@@ -369,10 +352,13 @@ public class Resources {
             return raw;
         }
     }
-    public CharSequence getText(int id) { return getString(id); }
+    public CharSequence getText(int id) {
+        String text = macapkStringForId(id);
+        return text != null ? text : ""; // Preserve the existing missing-resource fallback.
+    }
     public CharSequence getText(int id, CharSequence def) {
-        CharSequence cs = getString(id);
-        return (cs == null || cs.length() == 0) ? def : cs;
+        String text = id != 0 ? macapkStringForId(id) : null;
+        return text != null ? text : def;
     }
     public int getInteger(int id) {
         // Route through the apktool-decoded values/integers.xml index.
@@ -6846,38 +6832,20 @@ public class Resources {
      *  "Updated %d days ago" subtitle is a plural; the old getText-based
      *  fallback couldn't read a <plurals> and returned "". */
     public String getQuantityString(int id, int quantity) {
-        String t = macapkPluralTemplate(id, quantity);
-        if (t == null) {
-            // Fallback: treat as a plain string (legacy behavior).
-            try {
-                CharSequence s = getText(id);
-                return s != null ? String.format(s.toString(), quantity) : "";
-            } catch (Throwable ignored) { return ""; }
-        }
-        // 2-arg form: AOSP returns the raw selected text. We additionally
-        // substitute the count when the template carries a single numeric
-        // placeholder, matching the common caller expectation.
-        try { return String.format(t, quantity); }
-        catch (Throwable ignored) { return t; }
+        return getQuantityText(id, quantity).toString();
     }
     public String getQuantityString(int id, int quantity, Object... formatArgs) {
-        String t = macapkPluralTemplate(id, quantity);
-        if (t == null) {
-            try {
-                CharSequence s = getText(id);
-                t = (s != null) ? s.toString() : null;
-            } catch (Throwable ignored) { t = null; }
-            if (t == null) return "";
-        }
-        // AOSP: format the selected plural template with the supplied args
-        // (the quantity is only used to SELECT the form, not auto-prepended).
-        if (formatArgs == null || formatArgs.length == 0) return t;
-        try { return String.format(t, formatArgs); }
-        catch (Throwable ignored) { return t; }
+        String text = getQuantityText(id, quantity).toString();
+        if (formatArgs == null || formatArgs.length == 0) return text;
+        try { return String.format(text, formatArgs); }
+        catch (Throwable ignored) { return text; }
     }
     public CharSequence getQuantityText(int id, int quantity) {
-        String t = macapkPluralTemplate(id, quantity);
-        return t != null ? t : getQuantityString(id, quantity);
+        String text = macapkPluralTemplate(id, quantity);
+        // Retain the plain-string fallback without calling a virtual string
+        // accessor: wrappers commonly implement those via getQuantityText.
+        if (text == null) text = macapkStringForId(id);
+        return text != null ? text : "";
     }
     /** Resolve a <plurals> id to its template for `quantity` via the
      *  ResourceIndex. Returns null when the id isn't a known plural. */
