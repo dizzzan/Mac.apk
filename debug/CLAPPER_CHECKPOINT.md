@@ -81,6 +81,15 @@ updated live run Agora reported its first rendered frames after about two
 seconds; continuous usable playback remains unverified because of the warning
 and silent audio. This is not a claim that Clapper's environment check is fixed.
 
+A subsequent fresh session with the same build showed live video and controls;
+OpenSL ES opened a real 48 kHz stereo output and continuously consumed queued
+audio buffers. The owner confirmed **"Video moves with sound."** No additional
+audio implementation change was needed. An intervening session stopped audio
+and left its channel while showing a content-warning screen, so that trace was
+not used as evidence of an audio-backend defect. Live video and audio therefore
+work in the confirmed session; the environment warning seen in other sessions
+remains unresolved, and broad live-stream compatibility is not established.
+
 ## Login dialog visibility
 
 The "Use Phone / Email" button started LoginActivity, but the previous sign-in
