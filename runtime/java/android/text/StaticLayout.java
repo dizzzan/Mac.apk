@@ -6,6 +6,12 @@
 package android.text;
 
 public class StaticLayout extends Layout {
+    /** AOSP's hidden overload is also used reflectively by text widgets.
+     *  Capping changes the visible height, not the stored line count. */
+    public int getHeight(boolean cap) {
+        return cap ? macapkGetCappedHeight() : super.getHeight();
+    }
+
     public static Builder obtain(CharSequence source, int start, int end,
                                   android.text.TextPaint paint, int width) {
         return new Builder(source, start, end, paint, width);

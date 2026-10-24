@@ -155,6 +155,7 @@ public abstract class Layout {
     // (maxLines == MAX_VALUE, ellipsize == null) preserves the prior
     // full-text behavior for every existing caller.
     private int maxLines = Integer.MAX_VALUE;
+    private int maxLineHeight = -1;
     private android.text.TextUtils.TruncateAt ellipsizeMode;
     // BISECT GATE, shared by name with android.widget.TextView:
     // MACAPK_TEXT_LINES_AOSP=0 restores the pre-gate line breaking and
@@ -274,6 +275,7 @@ public abstract class Layout {
         this.lineHeightSpansApplied = false;
         this.lineTops = null;
         this.lineAscents = null;
+        this.maxLineHeight = -1;
         // The has-metric-spans answer is only valid for one layout pass: a
         // SpannableStringBuilder can gain a span without its identity
         // changing, and a stale "no spans" answer would silently put us back
@@ -758,6 +760,7 @@ public abstract class Layout {
         lineAscents = new int[n];
         topPadding = 0;
         bottomPadding = 0;
+        maxLineHeight = -1;
         int v = 0;
         for (int k = 0; k < n; k++) {
             final boolean lastLine = (k == n - 1);
@@ -800,6 +803,11 @@ public abstract class Layout {
             }
             lineTops[k] = v;
             lineAscents[k] = above;
+            // AOSP StaticLayout.out(): the last visible line gets bottom
+            // padding and no trailing line spacing, even if more lines follow.
+            if (k + 1 == maxLines) {
+                maxLineHeight = v + ((includePad ? bottom : below) - above);
+            }
             v += (below - above) + extra;
         }
         lineTops[n] = v;
@@ -966,6 +974,14 @@ public abstract class Layout {
      *  sum. That is the identity TXT.layout.*.heightIsLineTopOfCount asserts. */
     public int getHeight() { return getLineTop(getLineCount()); }
 
+    /** Geometry shared with StaticLayout.getHeight(boolean). Keep all broken
+     *  lines; only the height returned to a capped caller changes. */
+    protected final int macapkGetCappedHeight() {
+        int fullHeight = getLineTop(getLineCount()); // Also applies LineHeightSpan metrics.
+        return getLineCount() > maxLines && maxLineHeight != -1
+                ? maxLineHeight : fullHeight;
+    }
+
     /** AOSP's `StaticLayout.generate()` collects the paragraph's LineHeightSpans
      *  and `out()` seeds a FontMetricsInt with the line's own above/below, calls
      *  `chooseHeight()` on each span, then READS THE MUTATED fm BACK. That
@@ -1051,6 +1067,9 @@ public abstract class Layout {
             }
             tops[k] = v;
             asc[k] = above;
+            if (k + 1 == maxLines) {
+                maxLineHeight = v + ((includePad ? fm.bottom : below) - above);
+            }
             int h = (below - above) + extra;
             // A span that collapses a line to nothing would break the strictly
             // increasing-tops invariant every caller indexes by; fall back to
