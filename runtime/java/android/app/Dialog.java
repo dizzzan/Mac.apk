@@ -1040,6 +1040,19 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
         } catch (Throwable ignored) {}
     }
     public void show()      {
+        // AOSP Dialog.show/hide keep an attached window across a temporary
+        // hide (DialogFragment uses this when its activity stops). Restoring
+        // it must not rerun onStart/onShow or add another window.
+        if (mShowing) {
+            if (mDecorAdded != null) {
+                if (mWindow.hasFeature(android.view.Window.FEATURE_ACTION_BAR)) {
+                    mWindow.invalidatePanelMenu(android.view.Window.FEATURE_ACTION_BAR);
+                }
+                mDecorAdded.setVisibility(View.VISIBLE);
+            }
+            return;
+        }
+        mCanceled = false;
         mShowing = true;
         // AOSP dispatchOnCreate: onCreate(savedInstanceState) runs exactly once,
         // guarded, BEFORE onStart(). The standard idiom is a Dialog subclass that
@@ -1112,6 +1125,7 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
                 // (DialogWindow.ensureDecor: the config_prefDialogWidth
                 // pre-pass, then DecorView's macapkMinWidthPx; under
                 // MACAPK_DIALOG_WIDTH_AOSP=0, the old macapkFloatingWidthPx).
+                decor.setVisibility(View.VISIBLE);
                 ((android.view.WindowManager) wm).addView(decor, lp);
                 // Give the overlay stack a way back to this Dialog, so a tap
                 // OUTSIDE the decor can cancel it the way AOSP's
@@ -1469,7 +1483,11 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
     }
     private boolean mCanceled;
     private android.os.Message mCancelMessage;
-    public void hide() { mShowing = false; }
+    public void hide() {
+        // Keep mShowing: dismiss must still remove this attached window, and
+        // show must only reveal it. Visibility also controls overlay hit tests.
+        if (mDecorAdded != null) mDecorAdded.setVisibility(View.GONE);
+    }
 
     public void setTitle(CharSequence title) { this.mTitle = title; }
     public void setTitle(int resId) {}
@@ -1494,7 +1512,9 @@ public class Dialog implements DialogInterface, android.content.DialogInterface.
         return v;
     }
 
-    public boolean isShowing() { return mShowing; }
+    public boolean isShowing() {
+        return mDecorAdded != null && mDecorAdded.getVisibility() == View.VISIBLE;
+    }
     public Context getContext() { return mContext; }
     public android.view.Window getWindow() { return mWindow; }
 

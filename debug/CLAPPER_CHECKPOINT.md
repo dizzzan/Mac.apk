@@ -5,6 +5,30 @@ between clips. The owner confirmed **smooth playback and synchronized sound**
 after the MediaCodec input-buffer fix. This is a fork checkpoint, not an upstream
 PR or a claim of compatibility with all applications.
 
+## Login dialog visibility
+
+The "Use Phone / Email" button started LoginActivity, but the previous sign-in
+dialog remained above it and intercepted subsequent input. DialogFragment hides
+its dialog onStop; our Dialog.hide only cleared mShowing without hiding the
+decor. This also made dismiss return early and leave that window attached.
+
+Dialog.hide now sets the attached decor to GONE while preserving its lifecycle
+state. show restores an already-attached window without repeating onStart or
+onShow, isShowing reports actual visibility, and dismiss removes hidden windows.
+This follows [AOSP Dialog](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/app/Dialog.java).
+The rebuilt Clapper app now opens the phone form and switches to the email form.
+Authenticated sign-in still requires verification with the owner's account.
+
+The regression fails on the previous implementation and passes all 13 checks
+with the fix, including touch routing, hide/show lifecycle counts, dismiss while
+hidden, and reuse after dismissal. Run after building the Java jars:
+
+```sh
+mkdir -p runtime/build/dialog-tests
+"$JAVA_HOME/bin/javac" -cp 'runtime/build/lib/*' -d runtime/build/dialog-tests debug/DialogVisibilityTest.java
+"$JAVA_HOME/bin/java" -Djava.awt.headless=true -cp 'runtime/build/dialog-tests:runtime/build/lib/*' DialogVisibilityTest
+```
+
 ## Playback failure and fix
 
 MediaCodec returned reused input buffers with their previous position and limit.
