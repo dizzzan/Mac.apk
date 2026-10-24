@@ -1,3 +1,4 @@
+#include "macapk/compat_profile.h"
 // main.cpp -- v2 launcher entry point.
 //
 // Sequence (kept short on purpose -- the JVM does most of the work):
@@ -2227,6 +2228,7 @@ static void MacApkRunLockCloexec() {
 }
 
 int main(int argc, char** argv) {
+    macapk::ApplyCompatibilityProfile();
     const long long main_entry_ms = NowEpochMs();   // BOOTSPEED clock: stub + dyld cost
     MacApkRunLockCloexec();
     CliArgs cli = ParseArgs(argc, argv);

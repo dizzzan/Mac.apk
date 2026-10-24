@@ -1,3 +1,4 @@
+#include "macapk/stream_recorder.h"
 // cocoa_bridge.mm -- the runtime's Cocoa surface.
 //
 // Owns NSApplication, the single primary NSWindow, and an MTKView used
@@ -3626,6 +3627,7 @@ static void macapk_terminate_now(int code) {
     // Idempotent: AppKit can deliver a close and a terminate: for one quit.
     static std::atomic<bool> s_terminating{false};
     if (s_terminating.exchange(true)) return;
+    StreamRecorderFinishOnExit();
 
     const bool group = macapk_quit_process_group_on();
     const long long t0 = macapk_wall_ms();
@@ -4184,6 +4186,7 @@ bool CocoaInit() {
         // replacement for the Android on-screen nav glyph. Same KEYCODE_BACK ->
         // onBackPressed path as Esc / Cmd+[.
         InstallBackTitlebarAccessory(g_placeholder_window);
+        StreamRecorderInstallTitlebar((void*)g_placeholder_window);
         // v1.0.1649 (phase 2a): the window delegate, BEFORE the optional
         // fullscreen toggle below, so a --fullscreen launch goes through the
         // same fullscreen transition as the green button.
@@ -6995,6 +6998,22 @@ extern "C" void CocoaPresentVideoFrame(void* pixbuf, int /*width*/, int /*height
     // g_video_layer machinery entirely -- a TextureView-bound video must
     // not ALSO flash fullscreen behind its own composited position.
     if (MacapkOfferDecodedFrameToTextureView(pixbuf)) return;
+
+    // The fallback video plane is also raw decoded media. TextureView consumers
+    // record at their latch instead, so a frame never enters both sources.
+    CVPixelBufferRef recordBuffer = (CVPixelBufferRef)pixbuf;
+    const int rw = (int)CVPixelBufferGetWidth(recordBuffer), rh = (int)CVPixelBufferGetHeight(recordBuffer);
+    uint64_t recordTicket = StreamRecorderObserve(UINT64_MAX, rw, rh);
+    if (recordTicket && CVPixelBufferGetPixelFormatType(recordBuffer) == kCVPixelFormatType_32BGRA) {
+        const double now = StreamRecorderHostSeconds();
+        CVPixelBufferLockBaseAddress(recordBuffer, kCVPixelBufferLock_ReadOnly);
+        const auto* bytes = (const uint8_t*)CVPixelBufferGetBaseAddress(recordBuffer);
+        const size_t stride = CVPixelBufferGetBytesPerRow(recordBuffer);
+        std::vector<uint32_t> pixels((size_t)rw * rh);
+        for (int y = 0; y < rh; ++y) memcpy(pixels.data() + y * rw, bytes + y * stride, rw * 4);
+        CVPixelBufferUnlockBaseAddress(recordBuffer, kCVPixelBufferLock_ReadOnly);
+        StreamRecorderVideo(recordTicket, std::move(pixels), rw, rh, now);
+    }
 
     // Retain across the (possibly async) hop to main: the caller's own
     // reference may be released the instant this call returns.

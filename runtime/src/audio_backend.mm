@@ -1,3 +1,4 @@
+#include "macapk/stream_recorder.h"
 // audio_backend.mm -- real macOS audio output for Mac.apk.
 //
 // PHASE 1 + PHASE 2 of "make sound work" (docs/future_implementations.md
@@ -774,10 +775,13 @@ static void ensure_engine_locked() {
         if (dump_path && *dump_path) {
             g_dump = new WavDump();
             g_dump->open(dump_path);
-            // Tap the mixer's output bus -> exactly what goes to the device.
-            NodeInstallTap(mixer, 0, 4096, nil,
+            std::fprintf(stderr, "[audio] DUMP enabled -> %s\n", dump_path);
+        }
+        // One shared tap: AVAudioNode allows only one tap per bus. The recorder
+        // returns immediately while idle and copies only while explicitly on.
+        NodeInstallTap(mixer, 0, 4096, nil,
                              ^(AVAudioPCMBuffer* buf, AVAudioTime* when) {
-                (void)when;
+                @autoreleasepool { macapk::StreamRecorderAudio((void*)buf, (void*)when); }
                 if (!g_dump || !buf) return;
                 // Engine-owned tap thread, no guaranteed draining pool, and
                 // `buf.format` below returns an unowned object each delivery.
@@ -807,8 +811,6 @@ static void ensure_engine_locked() {
                 g_dump->append(out.data(), frames, sr, ch);
                 }   // @autoreleasepool
             });
-            std::fprintf(stderr, "[audio] DUMP enabled -> %s\n", dump_path);
-        }
 
         NSError* err = nil;
         // MACAPK_AUDIO_TEST_NO_OUTPUT=1 is a TEST HOOK, not a feature: it

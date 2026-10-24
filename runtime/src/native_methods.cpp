@@ -1,3 +1,4 @@
+#include "macapk/stream_recorder.h"
 // native_methods.cpp -- JNI exports the Android framework reimpl
 #include <pthread/qos.h>
 // (Java code under runtime/java/) calls into.

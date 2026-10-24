@@ -81,6 +81,18 @@ import android.os.Looper;
 import android.os.Message;
 
 public class SurfaceTexture {
+    private static final java.util.concurrent.atomic.AtomicLong sRecordingIds =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final long mRecordingId = sRecordingIds.incrementAndGet();
+    private static volatile boolean sRecordingNativeAvailable = true;
+    private static native void nativeRecordDecodedFrame(long source, int[] argb,
+                                                        int width, int height, int stride, boolean renderedSurface);
+    private void recordDecodedFrame(int[] argb, int width, int height, int stride, boolean renderedSurface) {
+        if (!sRecordingNativeAvailable) return;
+        try { nativeRecordDecodedFrame(mRecordingId, argb, width, height, stride, renderedSurface); }
+        catch (UnsatisfiedLinkError oldRuntime) { sRecordingNativeAvailable = false; }
+    }
+
     /**
      * Callback interface for being notified that a new stream frame is available.
      */
@@ -392,6 +404,7 @@ public class SurfaceTexture {
             latchCameraFrameToGl(cam, tex);
         } else if (vArgb != null) {
             latchDecodedFrameToGl(vArgb, vW, vH, vStride, tex, vPremul);
+            if (!vPremul) recordDecodedFrame(vArgb, vW, vH, vStride, false);
             if (vRecycle != null) vRecycle.accept(vArgb);
         }
         // A stream with no attached frame source has no pixels to bind; the
@@ -1135,6 +1148,7 @@ public class SurfaceTexture {
         int[] vArgb = null;
         int vW = 0, vH = 0, vStride = 0;
         java.util.function.Consumer<int[]> vRecycle = null;
+        boolean vPremul = false;
         synchronized (mLock) {
             cam = mCamSession;
             if (mAbandoned) return mLatchBitmap;
@@ -1150,6 +1164,7 @@ public class SurfaceTexture {
                 // no GL-origin correction.
                 vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
                 vStride = mVideoFrameStride;
+                vPremul = mVideoFrameGlPremul;
                 mCurrentTimestamp = mPendingTimestamp;
                 mCurrentDataSpace = mPendingDataSpace;
                 mHasVideoFrame = false;
@@ -1175,6 +1190,11 @@ public class SurfaceTexture {
                 mLatchBitmap = Bitmap.createBitmap(vW, vH, Bitmap.Config.ARGB_8888);
             }
             mLatchBitmap.setPixels(vArgb, 0, vStride, 0, 0, vW, vH);
+            // Software-decoded RTC video can arrive through an EGL producer.
+            // This is the individual TextureView buffer, before chat/controls
+            // are drawn into the Android window. Prefer raw codec frames when
+            // available; never record the final window bitmap.
+            recordDecodedFrame(vArgb, vW, vH, vStride, vPremul);
             // The copy is done; the producer may refill this buffer now.
             if (vRecycle != null) vRecycle.accept(vArgb);
             mLatchGeneration++;

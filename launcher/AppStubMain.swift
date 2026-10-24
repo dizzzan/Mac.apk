@@ -951,6 +951,25 @@ struct AppStubMain {
         //    adopts Dock icon + window title from MACAPK_APP_ICON /
         //    MACAPK_APP_LABEL / MACAPK_DEFAULT_ICON. Cache dir points at the
         //    versioned code-cache side of the bundle's android tree.
+        // Finder starts a fresh process, so it cannot inherit the launcher's
+        // per-app environment. Resolve the same saved overrides here, keyed by
+        // the versioned registry identity, before initializing the runtime.
+        do {
+            let registry = try RegistryStore.shared.loadReadOnly()
+            let defaults = UserDefaults(suiteName: "org.macapk.launcher")
+            let raw = defaults?.string(forKey: "org.macapk.launcher.defaultEnv")
+            var environment = registry.settings.defaultEnv
+            if let data = raw?.data(using: .utf8),
+               let saved = try? JSONDecoder().decode([String: String].self, from: data) {
+                environment.merge(saved) { _, saved in saved }
+            }
+            if let dirName, let record = registry.apps.first(where: { $0.dirName == dirName }) {
+                environment.merge(record.env) { _, perApp in perApp }
+            }
+            for (key, value) in environment { setenv(key, value, 1) }
+        } catch {
+            stubLog("environment: could not read saved settings (\(error.localizedDescription))")
+        }
         setenv("MACAPK_APP_CACHE_DIR", codeDir.path, 1)
         setenv("MACAPK_APP_LABEL", label, 1)
         //

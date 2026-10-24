@@ -95,7 +95,23 @@ jboolean SurfaceTexture_uploadExternalFrame(JNIEnv* env, jclass, jint texture,
 #endif
 }
 
+// Consumed decoder or dedicated TextureView buffers, before window composition.
+// Intermediate EGL consumers are filtered in Java to avoid recording them twice.
+void SurfaceTexture_recordDecodedFrame(JNIEnv* env, jclass, jlong source, jintArray argb,
+                                       jint width, jint height, jint stride, jboolean renderedSurface) {
+    uint64_t ticket = StreamRecorderObserve(source, width, height, renderedSurface);
+    if (!ticket || !argb || stride < width || width <= 0 || height <= 0 ||
+        int64_t(stride) * (height - 1) + width > env->GetArrayLength(argb)) return;
+    const double now = StreamRecorderHostSeconds();
+    std::vector<uint32_t> pixels(size_t(width) * height);
+    if (stride == width) env->GetIntArrayRegion(argb, 0, width * height, reinterpret_cast<jint*>(pixels.data()));
+    else for (int y = 0; y < height && !env->ExceptionCheck(); ++y)
+        env->GetIntArrayRegion(argb, y * stride, width, reinterpret_cast<jint*>(pixels.data() + y * width));
+    if (!env->ExceptionCheck()) StreamRecorderVideo(ticket, std::move(pixels), width, height, now);
+}
+
 static const JNINativeMethod kSurfaceTextureGlMethods[] = {
+    {(char*)"nativeRecordDecodedFrame", (char*)"(J[IIIIZ)V", (void*)SurfaceTexture_recordDecodedFrame},
     {(char*)"nativeUploadExternalFrame", (char*)"(IIILjava/nio/ByteBuffer;)Z",
      (void*)SurfaceTexture_uploadExternalFrame},
 };

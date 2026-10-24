@@ -5954,6 +5954,7 @@ struct AppDetailSheet: View {
                 identitySection
                 storageSection
                 macAppSection
+                compatibilitySection
                 Section("Environment overrides") {
                     EnvEditor(env: Binding(
                         get: { library.current(app).env },
@@ -5977,6 +5978,32 @@ struct AppDetailSheet: View {
         }
         .frame(width: 520, height: 620)
         .onAppear(perform: rescan)
+    }
+
+    private func environmentSetting(_ key: String, fallback: String = "") -> Binding<String> {
+        Binding(get: { current.env[key] ?? fallback }, set: { value in
+            var env = current.env
+            if value.isEmpty { env.removeValue(forKey: key) } else { env[key] = value }
+            library.setEnv(env, for: current)
+        })
+    }
+
+    private var compatibilitySection: some View {
+        Section("Compatibility") {
+            Picker("Native playback", selection: environmentSetting("MACAPK_COMPAT_PROFILE")) {
+                Text("Standard").tag("")
+                Text("Native video").tag("native-video")
+                Text("Extended native video").tag("execution-copy")
+            }
+            Toggle("Simulate missing phone sensors", isOn: Binding(
+                get: { current.env["MACAPK_MOCK_SENSORS"] == "1" },
+                set: { environmentSetting("MACAPK_MOCK_SENSORS").wrappedValue = $0 ? "1" : "0" }))
+            Toggle("Simulate a Bluetooth adapter", isOn: Binding(
+                get: { current.env["MACAPK_MOCK_BLUETOOTH"] == "1" },
+                set: { environmentSetting("MACAPK_MOCK_BLUETOOTH").wrappedValue = $0 ? "1" : "0" }))
+            Text("Changes apply next launch, including launches from Finder. Simulated sensors use fixed readings; the simulated Bluetooth adapter cannot connect to devices.")
+                .font(.caption).foregroundColor(.secondary)
+        }
     }
 
     private var identitySection: some View {
