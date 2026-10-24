@@ -4,6 +4,16 @@
 #include <initializer_list>
 
 namespace macapk {
+inline bool ParseConfiguredWindowSize(const char* value, int& width, int& height) {
+    if (!value || *value < '0' || *value > '9') return false;
+    char* end = nullptr;
+    long w = std::strtol(value, &end, 10);
+    if (*end != 'x' || end[1] < '0' || end[1] > '9') return false;
+    long h = std::strtol(end + 1, &end, 10);
+    if (*end || w < 160 || h < 160 || w > 8192 || h > 8192) return false;
+    width = (int)w; height = (int)h; return true;
+}
+
 // Named, per-launch presets replace diagnostic shell scripts. Explicit
 // environment overrides always win, including an explicit "0".
 inline void ApplyCompatibilityProfile() {

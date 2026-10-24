@@ -390,6 +390,9 @@ void Usage(const char* exe) {
 
 CliArgs ParseArgs(int argc, char** argv) {
     CliArgs a;
+    // Per-app launcher settings also reach Finder shortcuts through their
+    // saved environment. Explicit command-line dimensions still take priority.
+    macapk::ParseConfiguredWindowSize(std::getenv("MACAPK_WINDOW_SIZE"), a.width, a.height);
     for (int i = 1; i < argc; ++i) {
         std::string s = argv[i];
         auto need = [&](int more) {

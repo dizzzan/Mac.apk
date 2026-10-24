@@ -5990,6 +5990,12 @@ struct AppDetailSheet: View {
 
     private var compatibilitySection: some View {
         Section("Compatibility") {
+            Picker("Window size", selection: environmentSetting("MACAPK_WINDOW_SIZE")) {
+                Text("Automatic").tag("")
+                ForEach(kPhonePresets.filter { !$0.isAuto }) { preset in
+                    Text(preset.label).tag(preset.id)
+                }
+            }
             Picker("Native playback", selection: environmentSetting("MACAPK_COMPAT_PROFILE")) {
                 Text("Standard").tag("")
                 Text("Native video").tag("native-video")

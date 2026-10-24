@@ -30,6 +30,9 @@ finalization. A crash or forced kill can leave an unfinished temporary file.
 Open an installed app's Get Info panel in Mac.apk and use Compatibility. Changes
 apply on the next launch, including Finder/Dock shortcuts:
 
+Window size can also be saved per app (for example, 540 × 960). It uses
+`MACAPK_WINDOW_SIZE=540x960`; explicit command-line dimensions take priority.
+
 - **Native video** enables the lightweight native-code settings used by TikTok Lite.
 - **Extended native video** enables execution-copy/TLS handling and native texture
   windows used by Clapper. These are optional per-app presets, not package checks.
