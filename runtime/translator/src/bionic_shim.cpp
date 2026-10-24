@@ -1894,6 +1894,7 @@ static bool macapk_shadow_fold(ucontext_t* uc, uintptr_t pc, uintptr_t fa);
 // forward-declared here for the guest-writes-to-host-code recovery below.
 namespace { bool macapk_range_hits_host_exec(uintptr_t lo, uintptr_t hi); }
 extern "C" unsigned long __stack_chk_guard;  // process stack canary (defined later); used by the pairip TLS-canary fault fixup
+static bool macapk_pc_in_syscall_shadow(uintptr_t pc);
 static bool try_recover_arm64_native_null_deref(siginfo_t* info, ucontext_t* uc) {
     // DIAGNOSTIC OPT-OUT (default OFF -> recovery stays ON, no regression).
     // MACAPK_NULL_RECOVERY_OFF=1 disables this default-on recovery so the
@@ -2205,8 +2206,8 @@ static bool try_recover_arm64_native_null_deref(siginfo_t* info, ucontext_t* uc)
         s_addr_in_image = reinterpret_cast<addr_in_image_fn>(
             dlsym(RTLD_DEFAULT, "__macapk_arm64_native_addr_in_image"));
     }
-    if (!s_addr_in_image
-        || !s_addr_in_image(reinterpret_cast<const void*>(pc))) {
+    if ((!s_addr_in_image || !s_addr_in_image(reinterpret_cast<const void*>(pc))) &&
+        !(tpidr_magic_fault && macapk_pc_in_syscall_shadow(pc))) {
         return false;
     }
     uint32_t insn = *reinterpret_cast<const uint32_t*>(pc);
@@ -2591,21 +2592,104 @@ static void macapk_pairip_crashdump(int sig, siginfo_t* info, void* ucontext);
 // so entries live in a small fixed array scanned per fault -- a SINGLE global slot would
 // misroute a second image's faults into the first image's shadow. 2026-09-16: generalised
 // from the pairip-only single-slot form to the default-for-all-apps table.
-struct MacapkSyscallGuard { uintptr_t lo, hi, shadow, wrapper; };
-static MacapkSyscallGuard g_sc_guards[8];
+struct MacapkSyscallGuard { uintptr_t lo, hi, shadow, wrapper; bool dynamic; };
+static MacapkSyscallGuard g_sc_guards[4096];
+static std::atomic<bool> g_sc_guard_live[4096];
+static std::atomic<uintptr_t> g_sc_guard_landing[4096]{};
+static std::atomic<uintptr_t> g_sc_guard_host_return[4096]{};
 static std::atomic<int>   g_sc_guard_n{0};
+extern "C" void __macapk_set_shadow_landing(uintptr_t original, uintptr_t landing, uintptr_t host_return) {
+    int n = g_sc_guard_n.load(std::memory_order_acquire);
+    for (int i=0; i<n; ++i) if (g_sc_guards[i].lo == original && g_sc_guard_live[i].load()) {
+        g_sc_guard_host_return[i].store(host_return,std::memory_order_release);
+        g_sc_guard_landing[i].store(landing, std::memory_order_release); return;
+    }
+}
+extern "C" uintptr_t __macapk_shadow_code_for(uintptr_t target) {
+    int n = g_sc_guard_n.load(std::memory_order_acquire);
+    for (int i=0; i<n; ++i) {
+        const auto& g=g_sc_guards[i];
+        if (target>=g.lo && target<g.hi && g_sc_guard_live[i].load(std::memory_order_acquire) &&
+            g_sc_guard_landing[i].load(std::memory_order_acquire)) return g.shadow+target-g.lo;
+    }
+    return target;
+}
+extern "C" uintptr_t __macapk_shadow_landing_for(uintptr_t target) {
+    int n = g_sc_guard_n.load(std::memory_order_acquire);
+    static std::atomic<unsigned> cache[4096]{};
+    auto& c = cache[(target >> 14) & 4095];
+    unsigned index = c.load(std::memory_order_relaxed);
+    auto match = [&](unsigned i) -> uintptr_t {
+        if (i >= unsigned(n) || !g_sc_guard_live[i].load(std::memory_order_acquire)) return 0;
+        const auto& g = g_sc_guards[i];
+        if (target < g.lo || target >= g.hi || (target & 3)) return 0;
+        uintptr_t landing = g_sc_guard_landing[i].load(std::memory_order_acquire);
+        return landing ? landing + (target - g.lo) * 2 : 0;
+    };
+    if (index) if (uintptr_t p = match(index - 1)) return p;
+    for (int i=0; i<n; ++i) if (uintptr_t p = match(i)) { c.store(i+1); return p; }
+    return 0;
+}
+extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* saved_lr) {
+    if (uintptr_t landing = __macapk_shadow_landing_for(target)) return landing;
+    static const bool host_returns = std::getenv("MACAPK_SHADOW_HOST_RETURN") != nullptr;
+    if (!host_returns || !saved_lr) return 0;
+    // Only a genuine Mach-O destination gets a host-return landing. Guest
+    // functions (including untranslatable pages and generated code) still
+    // receive the original LR, so reading it remains observable as on Android.
+    struct Entry { uintptr_t target; bool host; };
+    static thread_local Entry cache[256]{};
+    auto& e=cache[(target>>2)&255];
+    if (e.target != target) {
+        Dl_info info{}; bool host=dladdr(reinterpret_cast<void*>(target),&info)!=0;
+        e={target,host};
+    }
+    if (!e.host) return 0;
+    uintptr_t lr=*saved_lr;
+    int n=g_sc_guard_n.load(std::memory_order_acquire);
+    for (int i=0;i<n;++i) {
+        const auto& g=g_sc_guards[i];
+        if (lr>=g.lo && lr<g.hi && !(lr&3) && g_sc_guard_live[i].load()) {
+            uintptr_t landing=g_sc_guard_host_return[i].load(std::memory_order_acquire);
+            if (landing) *saved_lr=landing+(lr-g.lo)*4;
+            break;
+        }
+    }
+    return 0;
+}
+static void* macapk_original_return_address(void* address) {
+    uintptr_t pc=reinterpret_cast<uintptr_t>(address);
+    int n=g_sc_guard_n.load(std::memory_order_acquire);
+    for(int i=0;i<n;++i) {
+        uintptr_t base=g_sc_guard_host_return[i].load(std::memory_order_acquire);
+        if (base && pc>=base && pc-base<(g_sc_guards[i].hi-g_sc_guards[i].lo)*4 &&
+            g_sc_guard_live[i].load()) return reinterpret_cast<void*>(g_sc_guards[i].lo+(pc-base)/4);
+    }
+    return address;
+}
+static bool macapk_pc_in_syscall_shadow(uintptr_t pc) {
+    int n = g_sc_guard_n.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        const auto& g = g_sc_guards[i];
+        if (g_sc_guard_live[i].load(std::memory_order_acquire) &&
+            pc >= g.shadow && pc - g.shadow < g.hi - g.lo) return true;
+    }
+    return false;
+}
 extern "C" long __macapk_arm64_raw_syscall(long, long, long, long, long, long, long);
-extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
-                                                    uintptr_t shadow_base, uintptr_t wrapper_va) {
+static bool macapk_register_syscall_guard(uintptr_t page_lo, uintptr_t page_hi,
+                                          uintptr_t shadow_base, uintptr_t wrapper_va, bool dynamic) {
     static std::mutex registration_mutex;
     std::lock_guard<std::mutex> lock(registration_mutex);
     int n = g_sc_guard_n.load(std::memory_order_relaxed);
-    for (int i = 0; i < n; ++i) if (g_sc_guards[i].lo == page_lo) return false;
+    for (int i = 0; i < n; ++i)
+        if (g_sc_guard_live[i].load(std::memory_order_acquire) && g_sc_guards[i].lo == page_lo) return false;
     if (n >= (int)(sizeof(g_sc_guards) / sizeof(g_sc_guards[0]))) {
         std::fprintf(stderr, "[guard] table full (%d entries) -- page %#lx NOT guarded\n",
                      n, (unsigned long)page_lo); std::fflush(stderr); return false;
     }
-    g_sc_guards[n] = { page_lo, page_hi, shadow_base, wrapper_va };
+    g_sc_guards[n] = { page_lo, page_hi, shadow_base, wrapper_va, dynamic };
+    g_sc_guard_live[n].store(true, std::memory_order_release);
     g_sc_guard_n.store(n + 1, std::memory_order_release);   // publish after the slot is filled
     std::fprintf(stderr, "[guard] handler armed #%d: page [%#lx,%#lx) shadow %#lx wrapper %#lx\n",
                  n, (unsigned long)page_lo, (unsigned long)page_hi,
@@ -2613,17 +2697,44 @@ extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t page_lo, uintptr_t
     std::fflush(stderr);
     return true;
 }
+extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
+                                                    uintptr_t shadow_base, uintptr_t wrapper_va) {
+    return macapk_register_syscall_guard(page_lo, page_hi, shadow_base, wrapper_va, false);
+}
+static void macapk_remove_syscall_guards(uintptr_t lo, size_t len) {
+    if (lo + len < lo) return;
+    int n = g_sc_guard_n.load(std::memory_order_acquire);
+    for (int i = 0; i < n; ++i) {
+        const auto& g = g_sc_guards[i];
+        if (g.lo >= lo + len || g.hi <= lo || !g_sc_guard_live[i].exchange(false)) continue;
+        if (g.dynamic) mach_vm_deallocate(mach_task_self(), g.shadow, 0xc000);
+    }
+}
 extern "C" void __macapk_set_syscall_guard_page(uintptr_t page_lo, uintptr_t page_hi,
                                                 uintptr_t shadow_base, uintptr_t wrapper_va) {
     (void)__macapk_try_set_syscall_guard_page(page_lo, page_hi, shadow_base, wrapper_va);
 }
-static bool macapk_syscall_guard_fault(ucontext_t* uc, uintptr_t pc) {
+static bool macapk_syscall_guard_fault(ucontext_t* uc, uintptr_t pc, bool static_only = false) {
+    unsigned ec = uc->uc_mcontext->__es.__esr >> 26;
+    if (ec != 0x20 && ec != 0x21) return false;
     int n = g_sc_guard_n.load(std::memory_order_acquire);
     if (!n) return false;                                    // guard not armed: cheap exit
+    // Immutable guard records permit a lock-free direct-mapped lookup cache.
+    // A collision or invalidated dynamic mapping falls back to the full scan.
+    static std::atomic<unsigned> cache[4096]{};
+    auto& entry = cache[(pc >> 14) & 4095];
+    unsigned cached = entry.load(std::memory_order_relaxed);
     const MacapkSyscallGuard* g = nullptr;
-    for (int i = 0; i < n; ++i)
-        if (pc >= g_sc_guards[i].lo && pc < g_sc_guards[i].hi) { g = &g_sc_guards[i]; break; }
-    if (!g) return false;
+    if (cached && cached <= unsigned(n) && g_sc_guard_live[cached - 1].load(std::memory_order_acquire)) {
+        const auto& candidate = g_sc_guards[cached - 1];
+        if (pc >= candidate.lo && pc < candidate.hi) g = &candidate;
+    }
+    for (int i = 0; !g && i < n; ++i)
+        if (g_sc_guard_live[i].load(std::memory_order_acquire) &&
+            pc >= g_sc_guards[i].lo && pc < g_sc_guards[i].hi) { g = &g_sc_guards[i]; entry.store(i + 1, std::memory_order_relaxed); break; }
+    if (!g || (static_only && g->dynamic)) return false;
+    static const bool preserve_x18 = std::getenv("MACAPK_TPIDR_SHADOW") != nullptr;
+    if (preserve_x18) macapk_enable_x18_preservation();
     auto& ss = uc->uc_mcontext->__ss;
     bool is_wrapper = (pc == g->wrapper);
     { static std::atomic<long> gn{0}; long k = gn.fetch_add(1);
@@ -3226,6 +3337,11 @@ static bool macapk_fault_wx_handle(void* context) {
     int saved_errno = errno;
     if (execute) {
         macapk_prepare_dynamic_syscalls(page, 0x4000, PROT_READ | PROT_EXEC);
+        if (macapk_syscall_guard_fault(uc, mc.__ss.__pc)) {
+            ::mprotect(page, 0x4000, PROT_READ);
+            errno = saved_errno;
+            return true;
+        }
         __builtin___clear_cache(static_cast<char*>(page), static_cast<char*>(page) + 0x4000);
     }
     int rc = ::mprotect(page, 0x4000, PROT_READ | (execute ? PROT_EXEC : PROT_WRITE));
@@ -3235,6 +3351,10 @@ static bool macapk_fault_wx_handle(void* context) {
 
 static void macapk_segv_handler(int sig, siginfo_t* info, void* ucontext) {
 #if defined(__APPLE__) && defined(__aarch64__)
+    // Static execution copies never need a dynamic W^X transition. Handle
+    // their instruction faults before scanning the anonymous-code registry.
+    if (ucontext && macapk_syscall_guard_fault(static_cast<ucontext_t*>(ucontext),
+            static_cast<ucontext_t*>(ucontext)->uc_mcontext->__ss.__pc, true)) return;
     if (macapk_fault_wx_handle(ucontext)) return;
     // pairip resolver guard (FIRST -- cheapest, and a fault here is expected): a fault
     // while a resolver program is running is its self-verify detonation. Unwind back to
@@ -14494,6 +14614,7 @@ static constexpr uint16_t kSvcBrkTag  = 0x4D41;   // "MA" (Mac.apk), in the safe
 static constexpr uint32_t kSvcBrkInsn = 0xD4200000u | ((uint32_t)kSvcBrkTag << 5);
 static struct sigaction g_old_trap_sa{};
 
+extern "C" void* __macapk_guest_thread_pointer();
 static void macapk_svc_brk_sigtrap(int sig, siginfo_t* info, void* ucontext) {
     ucontext_t* uc = ucontext ? static_cast<ucontext_t*>(ucontext) : nullptr;
     if (uc && uc->uc_mcontext) {
@@ -14502,6 +14623,40 @@ static void macapk_svc_brk_sigtrap(int sig, siginfo_t* info, void* ucontext) {
         uintptr_t brk_pc = 0;
         if (pc && !(pc & 3)) {
             uint32_t at = *reinterpret_cast<const uint32_t*>(pc);
+            unsigned tag = (at >> 5) & 0xffffu;
+            if ((at & 0xffe0001fu) == 0xd4200000u && tag >= 0x4da0 && tag <= 0x4da2) {
+                int n = g_sc_guard_n.load(std::memory_order_acquire);
+                for (int i = 0; i < n; ++i) {
+                    const auto& g = g_sc_guards[i];
+                    if (!g_sc_guard_live[i].load(std::memory_order_acquire) ||
+                        pc < g.shadow || pc - g.shadow >= 0xc000) continue;
+                    uintptr_t offset = pc - g.shadow, target = 0;
+                    if (tag == 0x4da0 && offset < g.hi - g.lo) {
+                        uint32_t original = *reinterpret_cast<const uint32_t*>(g.lo + offset);
+                        if ((original & 0x7c000000u) != 0x14000000u) break;
+                        int64_t displacement = int64_t(int32_t(original << 6) >> 6) * 4;
+                        target = g.lo + offset + displacement;
+                        if (original & 0x80000000u) ss.__lr = g.lo + offset + 4;
+                    } else if (tag == 0x4da1 && offset == g.hi - g.lo) target = g.hi;
+                    else if (tag == 0x4da2 && offset > g.hi - g.lo && offset + 12 <= 0xc000)
+                        std::memcpy(&target, reinterpret_cast<const void*>(pc + 4), 8);
+                    else break;
+                    macapk_enable_x18_preservation();
+                    ss.__pc = target;
+                    return;
+                }
+            }
+            constexpr uint32_t tls_brk = 0xd4200000u | (0x4d80u << 5);
+            if ((at & ~(31u << 5)) == tls_brk && macapk_pc_in_syscall_shadow(pc)) {
+                macapk_enable_x18_preservation();
+                unsigned rt = (at >> 5) & 31u;
+                uintptr_t tp = reinterpret_cast<uintptr_t>(__macapk_guest_thread_pointer());
+                if (rt < 29) ss.__x[rt] = tp;
+                else if (rt == 29) ss.__fp = tp;
+                else if (rt == 30) ss.__lr = tp;
+                ss.__pc = pc + 4;
+                return;
+            }
             if (at == kSvcBrkInsn) brk_pc = pc;                       // pc AT the BRK (XNU norm)
             else if (pc >= 4 &&
                      *reinterpret_cast<const uint32_t*>(pc - 4) == kSvcBrkInsn)
@@ -15224,7 +15379,7 @@ int32_t __macapk_invoke_safe(LiftedArmFn fn,
                               uint32_t sp) {
     if (macapk_arm32_skip_init_on()) {
         Dl_info di{};
-        void* ra = __builtin_return_address(0);
+        void* ra = macapk_original_return_address(__builtin_return_address(0));
         if (dladdr(ra, &di) && di.dli_sname &&
             std::strcmp(di.dli_sname, "__macapk_install_segments") == 0) {
             std::fprintf(stderr, "[arm32] MACAPK_ARM32_SKIP_INIT: skipped .init_array "
@@ -15755,7 +15910,7 @@ uint32_t __macapk_jni_make_handle(void* real_ptr) {
     }
     g_handle_to_ptr[h] = real_ptr;
     if (jni_trace_enabled()) {
-        void* ret = __builtin_return_address(0);
+        void* ret = macapk_original_return_address(__builtin_return_address(0));
         Dl_info di{};
         const char* sname = "?";
         std::ptrdiff_t off = 0;
@@ -15779,7 +15934,7 @@ void* __macapk_jni_resolve_handle(uint32_t h) {
     auto it = g_handle_to_ptr.find(h);
     void* real = it == g_handle_to_ptr.end() ? nullptr : it->second;
     if (jni_trace_enabled()) {
-        void* ret = __builtin_return_address(0);
+        void* ret = macapk_original_return_address(__builtin_return_address(0));
         Dl_info di{};
         const char* sname = "?";
         std::ptrdiff_t off = 0;
@@ -21886,7 +22041,7 @@ uint32_t __macapk_shim__Exit(uint32_t code, uint32_t a, uint32_t b, uint32_t c) 
         const char* sym = "?";
         std::ptrdiff_t off = 0;
         Dl_info info{};
-        void* ret_pc = __builtin_return_address(0);
+        void* ret_pc = macapk_original_return_address(__builtin_return_address(0));
         if (ret_pc && dladdr(ret_pc, &info)) {
             if (info.dli_sname) sym = info.dli_sname;
             if (info.dli_saddr) {
@@ -23176,7 +23331,7 @@ uint32_t __macapk_shim_setenv(uint32_t name, uint32_t value, uint32_t overwrite,
                       ? __macapk_arm64_setenv(n, v, static_cast<int>(overwrite))
                       : ((n && v) ? ::setenv(n, v, static_cast<int>(overwrite))
                                   : (errno = EINVAL, -1));
-    trace_env32("setenv", n, v, r, __builtin_return_address(0));
+    trace_env32("setenv", n, v, r, macapk_original_return_address(__builtin_return_address(0)));
     return static_cast<uint32_t>(r);
 }
 uint32_t __macapk_shim_unsetenv(uint32_t name, uint32_t, uint32_t, uint32_t) {
@@ -23184,7 +23339,7 @@ uint32_t __macapk_shim_unsetenv(uint32_t name, uint32_t, uint32_t, uint32_t) {
     const int r = macapk_guest_env_mutable_on()
                       ? __macapk_arm64_unsetenv(n)
                       : (n ? ::unsetenv(n) : (errno = EINVAL, -1));
-    trace_env32("unsetenv", n, nullptr, r, __builtin_return_address(0));
+    trace_env32("unsetenv", n, nullptr, r, macapk_original_return_address(__builtin_return_address(0)));
     return static_cast<uint32_t>(r);
 }
 uint32_t __macapk_shim_putenv(uint32_t str, uint32_t, uint32_t, uint32_t) {
@@ -23192,11 +23347,11 @@ uint32_t __macapk_shim_putenv(uint32_t str, uint32_t, uint32_t, uint32_t) {
     const int r = macapk_guest_env_mutable_on()
                       ? __macapk_arm64_putenv(s)
                       : (s ? ::putenv(s) : (errno = EINVAL, -1));
-    trace_env32("putenv", s, nullptr, r, __builtin_return_address(0));
+    trace_env32("putenv", s, nullptr, r, macapk_original_return_address(__builtin_return_address(0)));
     return static_cast<uint32_t>(r);
 }
 uint32_t __macapk_shim_clearenv(uint32_t, uint32_t, uint32_t, uint32_t) {
-    trace_env32("clearenv", nullptr, nullptr, 0, __builtin_return_address(0));
+    trace_env32("clearenv", nullptr, nullptr, 0, macapk_original_return_address(__builtin_return_address(0)));
     if (macapk_guest_env_mutable_on())
         return static_cast<uint32_t>(__macapk_arm64_clearenv());
     // MACAPK_GUEST_ENV_MUTABLE=0: the ARM32 getenv/setenv above read and write the HOST
@@ -23697,7 +23852,7 @@ static void trace_softfp_parse(const char* who, uint32_t s, double v, void* ret,
 int64_t __macapk_shim_atof_softfp(uint32_t s, uint32_t r1, uint32_t r2, uint32_t r3) {
     // Bionic's atof is strtod(s, NULL) (upstream-openbsd stdlib/atof.c).
     const double v = s ? std::strtod(gptr(s), nullptr) : 0.0;
-    trace_softfp_parse("atof", s, v, __builtin_return_address(0), r1, r2, r3);
+    trace_softfp_parse("atof", s, v, macapk_original_return_address(__builtin_return_address(0)), r1, r2, r3);
     return double_to_softfloat_i64(v);
 }
 int64_t __macapk_shim_strtod_softfp(uint32_t s, uint32_t endptr_addr,
@@ -23709,7 +23864,7 @@ int64_t __macapk_shim_strtod_softfp(uint32_t s, uint32_t endptr_addr,
         uint32_t guest_end = static_cast<uint32_t>(s + (end - gptr(s)));
         std::memcpy(g_guest_base + endptr_addr, &guest_end, sizeof(guest_end));
     }
-    trace_softfp_parse("strtod", s, v, __builtin_return_address(0));
+    trace_softfp_parse("strtod", s, v, macapk_original_return_address(__builtin_return_address(0)));
     return double_to_softfloat_i64(v);
 }
 
@@ -25376,7 +25531,7 @@ extern "C" size_t __macapk_arm64_strlen(const char* s) {
         // g_pairip_image_base is NOT set under GATE_OFF (the dispatch/base setup is off), so we
         // cannot filter to the pairip image here -- log the RAW caller lr + content and filter to
         // the libpairipcore range OFFLINE using the run-log's "mapped, base=0x..." line.
-        void* lr = __builtin_return_address(0);
+        void* lr = macapk_original_return_address(__builtin_return_address(0));
         char probe[256];
         bool ok = macapk_diag_safe_read(s, probe, 255);
         if (ok) { probe[255] = 0; for (char* p = probe; *p; ++p) if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7e) *p = '.'; }
@@ -26187,7 +26342,7 @@ extern "C" int __macapk_arm64_socket(int domain, int type, int protocol) {
     if (net_trace_on() && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
         // For AF_NETLINK (Linux dom 16) log the guest caller ra so we can pin what
         // needs netlink (Bionic getifaddrs interface-enum vs a WebRTC change monitor).
-        void* ra = (domain == 16) ? __builtin_return_address(0) : nullptr;
+        void* ra = (domain == 16) ? macapk_original_return_address(__builtin_return_address(0)) : nullptr;
         std::fprintf(stderr,
             "[net-trace] socket(lin dom=%d type=%d proto=%d -> mac dom=%d type=%d) "
             "fd=%d errno=%d ra=%p\n", domain, type, protocol, mdomain, mtype, fd, fd<0?e:0, ra);
@@ -28537,7 +28692,7 @@ static int macapk_futex_wait_word_raw(int32_t* addr, int32_t val,
         // so the parent frame is present. Accept it locally.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wframe-address"
-        oswait_log("PARK", addr, val, (uint64_t)__builtin_return_address(1));
+        oswait_log("PARK", addr, val, (uint64_t)macapk_original_return_address(__builtin_return_address(1)));
 #pragma clang diagnostic pop
     }
     const uint64_t want = static_cast<uint64_t>(static_cast<uint32_t>(val));
@@ -28587,7 +28742,7 @@ static inline int macapk_futex_wake_word(int32_t* addr, bool all) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wframe-address"
         oswait_log(all ? "WAKEall" : "WAKEany", addr, 0,
-                   (uint64_t)__builtin_return_address(1));
+                   (uint64_t)macapk_original_return_address(__builtin_return_address(1)));
 #pragma clang diagnostic pop
     }
     // Return the os_sync result so the MACAPK_MUTEX_HANDOFF revoke (unlock U3/U4) can learn
@@ -28831,7 +28986,7 @@ extern "C" int __macapk_arm64_pthread_mutex_lock(int32_t* m) {
                     (unsigned long long)owner, onm[0] ? onm : "-",
                     (unsigned long long)self,
                     __atomic_load_n(&m[kMutexCountSlot], __ATOMIC_RELAXED),
-                    __builtin_return_address(0));
+                    macapk_original_return_address(__builtin_return_address(0)));
                 std::fflush(stderr);
             }
         }
@@ -29940,7 +30095,7 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
     if (macapk_envp("MACAPK_FUTEX_TRACE")) {
         static std::atomic<int> wn{0};
         if (wn.fetch_add(1) < 80) {
-            void* ra0 = __builtin_return_address(0);
+            void* ra0 = macapk_original_return_address(__builtin_return_address(0));
             uint64_t tid=0; pthread_threadid_np(nullptr,&tid);
             std::fprintf(stderr, "[cond-trace] WAIT c=%p seen=%d ra0=%p tid=%llu\n",
                          (void*)c, seen, ra0, (unsigned long long)tid);
@@ -30049,7 +30204,7 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
                     "autoEn@f0=%u swDur@f8=%lld autoSwapInt@100=%d MATCH=%d ra=%p k=%d\n",
                     (void*)m, (long long)cv, curFrame, (unsigned)swEn,
                     (long long)swDur, asi, match ? 1 : 0,
-                    __builtin_return_address(0), k);
+                    macapk_original_return_address(__builtin_return_address(0)), k);
             }
         }
         // The Swappy render-pacing wait RE-ENTERS its mutex constantly (the
@@ -30207,7 +30362,7 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
     // cap-timeout so rtc::Event::Wait breaks its `while(!flag) cond_wait` loop and returns ->
     // ProcessMessages re-drains + re-dispatches. A real wake (broadcast bumped c[0]) returns 0.
     if (g_rtc_evwait_cap_ns &&
-        __builtin_return_address(0) == reinterpret_cast<void*>(g_rtc_evwait_infinite_ra.load())) {
+        macapk_original_return_address(__builtin_return_address(0)) == reinterpret_cast<void*>(g_rtc_evwait_infinite_ra.load())) {
         __macapk_arm64_pthread_mutex_unlock(m);
         macapk_futex_wait_word(&c[0], seen, g_rtc_evwait_cap_ns);
         int woken = (__atomic_load_n(&c[0], __ATOMIC_ACQUIRE) != seen);
@@ -30220,7 +30375,7 @@ extern "C" int __macapk_arm64_pthread_cond_wait(int32_t* c, int32_t* m) {
     // can tell if the trampoline shifted the return address off the registered rtc site.
     if (g_rtc_evwait_cap_ns) {
         static std::atomic<int> miss{0};
-        void* ra = __builtin_return_address(0);
+        void* ra = macapk_original_return_address(__builtin_return_address(0));
         uintptr_t want = g_rtc_evwait_infinite_ra.load();
         if ((uintptr_t)ra >= want - 0x40 && (uintptr_t)ra <= want + 0x40 && miss.fetch_add(1) < 4)
             { std::fprintf(stderr, "[rtc-evwait-cap] NEAR-MISS ra=%p want=%p (delta %+ld)\n", ra, (void*)want, (long)((intptr_t)ra-(intptr_t)want)); std::fflush(stderr); }
@@ -30942,7 +31097,7 @@ extern "C" int __macapk_arm64_sem_init(int32_t* sem, int /*pshared*/,
     sem[1] = 0; sem[2] = 0;
     __atomic_store_n(&sem[kSemMagicSlot], int32_t(kMacApkSemMagic),
                      __ATOMIC_RELEASE);
-    macapk_sem_trace("init", sem, (int)value, __builtin_return_address(0));
+    macapk_sem_trace("init", sem, (int)value, macapk_original_return_address(__builtin_return_address(0)));
     return 0;
 }
 // sem_getvalue: Bionic `int sem_getvalue(sem_t*, int* sval)`. libil2cpp's
@@ -30956,7 +31111,7 @@ extern "C" int __macapk_arm64_sem_getvalue(int32_t* sem, int* sval) {
     if (!macapk_arm64_sem_ensure_valid(sem)) { errno = EINVAL; return -1; }
     int v = __atomic_load_n(&sem[0], __ATOMIC_RELAXED);
     *sval = v;
-    macapk_sem_trace("getvalue", sem, v, __builtin_return_address(0));
+    macapk_sem_trace("getvalue", sem, v, macapk_original_return_address(__builtin_return_address(0)));
     return 0;
 }
 extern "C" int __macapk_arm64_sem_destroy(int32_t* sem) {
@@ -30975,7 +31130,7 @@ extern "C" int __macapk_arm64_sem_post(int32_t* sem) {
     // parked yet (saw count==0, about to call wait) will see the new nonzero
     // count and not block -- no token is lost.
     macapk_futex_wake_word(&sem[0], /*all=*/false);
-    macapk_sem_trace("post", sem, nv, __builtin_return_address(0));
+    macapk_sem_trace("post", sem, nv, macapk_original_return_address(__builtin_return_address(0)));
     return 0;
 }
 extern "C" int __macapk_arm64_sem_wait(int32_t* sem) {
@@ -30983,7 +31138,7 @@ extern "C" int __macapk_arm64_sem_wait(int32_t* sem) {
     if (!macapk_arm64_sem_ensure_valid(sem)) return -1;
     macapk_sem_trace("wait-enter", sem,
                        __atomic_load_n(&sem[0], __ATOMIC_RELAXED),
-                       __builtin_return_address(0));
+                       macapk_original_return_address(__builtin_return_address(0)));
     for (;;) {
         if (!macapk_arm64_sem_ensure_valid(sem)) return -1;
         int v = __atomic_load_n(&sem[0], __ATOMIC_RELAXED);
@@ -31024,7 +31179,7 @@ extern "C" int __macapk_arm64_sem_timedwait(int32_t* sem, const void* abs_timeou
     if (!macapk_arm64_sem_ensure_valid(sem)) return -1;
     macapk_sem_trace("timedwait", sem,
                        __atomic_load_n(&sem[0], __ATOMIC_RELAXED),
-                       __builtin_return_address(0));
+                       macapk_original_return_address(__builtin_return_address(0)));
     const int64_t* ts = reinterpret_cast<const int64_t*>(abs_timeout);
     for (;;) {
         if (!macapk_arm64_sem_ensure_valid(sem)) return -1;
@@ -31435,7 +31590,7 @@ extern "C" int __macapk_arm64_pthread_kill(unsigned long thread, int sig) {
             std::fprintf(stderr,
                 "[pkill] pthread_kill(thr=0x%lx tid=%llu sig=%d) ra=%p\n",
                 thread, (unsigned long long)tid, sig,
-                __builtin_return_address(0));
+                macapk_original_return_address(__builtin_return_address(0)));
             std::fflush(stderr);
         }
     }
@@ -32267,7 +32422,7 @@ extern "C" int __macapk_arm64_sigaction(int sig,
             std::fprintf(stderr,
                 "[sigact] sigaction(sig=%d handler=%p flags=0x%x) ra=%p\n",
                 sig, act ? (void*)act->bsa_handler : nullptr,
-                act ? (unsigned)act->bsa_flags : 0u, __builtin_return_address(0));
+                act ? (unsigned)act->bsa_flags : 0u, macapk_original_return_address(__builtin_return_address(0)));
             std::fflush(stderr);
         }
     }
@@ -32659,7 +32814,7 @@ extern "C" off_t __macapk_arm64_lseek64(int fd, off_t offset,
         std::fprintf(stderr,
             "[du3d] lseek64 fd=%d off=%lld whence=%d -> %lld ra=%p\n",
             fd, (long long)offset, whence, (long long)r,
-            __builtin_return_address(0));
+            macapk_original_return_address(__builtin_return_address(0)));
         // v1.0.171 diag: at the post-directory seek to the first block,
         // scan the stack for libunity/il2cpp return addresses to recover
         // the archive-loader call chain (File::Seek is vtable-dispatched
@@ -35920,7 +36075,7 @@ extern "C" int __macapk_arm64_dladdr(const void* addr, Dl_info* info) {
         std::fprintf(stderr, "[dladdr] addr=%p rc=%d base=%p file=%s caller=%p\n",
                      addr, result, result ? info->dli_fbase : nullptr,
                      result && info->dli_fname ? info->dli_fname : "?",
-                     __builtin_return_address(0));
+                     macapk_original_return_address(__builtin_return_address(0)));
     }
     return result;
 }
@@ -36137,7 +36292,7 @@ extern "C" int macapk_aaudio_unimpl_stub() {
         std::fprintf(stderr,
             "[arm64-shim] unimplemented AAudio symbol CALLED -> "
             "AAUDIO_ERROR_UNIMPLEMENTED(-890) (caller lr=%p). Implement it "
-            "if needed; not faking success.\n", __builtin_return_address(0));
+            "if needed; not faking success.\n", macapk_original_return_address(__builtin_return_address(0)));
     return -890;  // AAUDIO_ERROR_UNIMPLEMENTED
 }
 
@@ -36153,7 +36308,7 @@ extern "C" int macapk_opensl_unimpl_stub() {
         std::fprintf(stderr,
             "[arm64-shim] unimplemented OpenSL ES symbol CALLED -> "
             "SL_RESULT_FEATURE_UNSUPPORTED(12) (caller lr=%p).\n",
-            __builtin_return_address(0));
+            macapk_original_return_address(__builtin_return_address(0)));
     return 12;  // SL_RESULT_FEATURE_UNSUPPORTED
 }
 
@@ -36229,8 +36384,14 @@ std::atomic<bool> g_decouple_active{false};
 static bool macapk_trace_viewport_on();
 void* g_unity_egl_surface = nullptr;
 
+static void* macapk_texture_egl_create(void*, void*, void*, const int32_t*, bool*);
+static int macapk_texture_egl_destroy(void*, void*);
+
 extern "C" void* __macapk_arm64_egl_create_window_surface_bridge(
         void* dpy, void* config, void* win, const int32_t* attribs) {
+    bool handled = false;
+    void* result = macapk_texture_egl_create(dpy, config, win, attribs, &handled);
+    if (handled) return result;
     void* native = nullptr;
     if (win) {
         MacApkNativeWindow* mnw = reinterpret_cast<MacApkNativeWindow*>(win);
@@ -37844,6 +38005,13 @@ extern "C" unsigned __macapk_arm64_eglMakeCurrent(void* dpy, void* draw,
                        macapk_egl14_window_resolve(dpy, read), ctx) : 0;
 }
 
+extern "C" unsigned __macapk_arm64_eglDestroySurface(void* dpy, void* surf) {
+    int result = macapk_texture_egl_destroy(dpy, surf);
+    if (result >= 0) return static_cast<unsigned>(result);
+    static auto real = reinterpret_cast<unsigned (*)(void*, void*)>(dlsym(RTLD_DEFAULT, "eglDestroySurface"));
+    return real ? real(dpy, surf) : 0;
+}
+
 // eglQuerySurface: a forward to ANGLE that names a Java EGL14 window's current
 // pbuffer (GitHub #16), so native code sizing its viewport from EGL_WIDTH /
 // EGL_HEIGHT sees the window's size after a resize, as the Java bridge does.
@@ -38888,7 +39056,8 @@ extern "C" void* __macapk_arm64_eglCreateContext(void* dpy, void* config,
 extern "C" unsigned __macapk_arm64_eglGetError(void) {
     using Fn = unsigned (*)(void);
     static Fn real = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "eglGetError"));
-    unsigned r = real ? real() : 0x3000;
+    static auto windowError = reinterpret_cast<unsigned (*)()>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_error"));
+    unsigned r = windowError ? windowError() : (real ? real() : 0x3000);
     if (macapk_egl_trace_enabled())
         std::fprintf(stderr, "[egl-trace] eglGetError -> 0x%x\n", r);
     return r;
@@ -39012,6 +39181,8 @@ static void* macapk_arm64_dlsym_impl(void* handle, const char* name) {
     // counted, or it tears the display down under them.
     if (!std::strcmp(name, "eglInitialize")) return (void*)&__macapk_arm64_eglInitialize;
     if (!std::strcmp(name, "eglTerminate"))  return (void*)&__macapk_arm64_eglTerminate;
+    if (!std::strcmp(name, "eglDestroySurface")) return (void*)&__macapk_arm64_eglDestroySurface;
+    if (!std::strcmp(name, "eglGetError")) return (void*)&__macapk_arm64_eglGetError;
     // The remaining init-call passthroughs are diagnostic-only (route under
     // MACAPK_EGL_TRACE=1; else the guest gets ANGLE's directly).
     if (macapk_egl_trace_enabled()) {
@@ -40698,6 +40869,21 @@ static const std::string& macapk_arm64_exe_path() {
     return *link;
 }
 
+// proc_pid_root exposes this process's real root. Keep a symlink for lstat /
+// readlink; descendants re-enter the guest path resolver below so synthetic
+// mounts such as /proc remain accessible through /proc/self/root as well.
+static const std::string& macapk_arm64_root_path() {
+    static const std::string* link = [] {
+        const std::string base = macapk_proc_dir_base() + "/self";
+        macapk_mkdirs(base);
+        auto* path = new std::string(base + "/root");
+        ::unlink(path->c_str());
+        ::symlink("/", path->c_str());
+        return path;
+    }();
+    return *link;
+}
+
 static const std::string& macapk_arm64_live_path(const char* basename,
                                                  void (*writer)(FILE*)) {
     static std::mutex* m = new std::mutex();
@@ -42277,7 +42463,7 @@ static std::string macapk_arm64_remap_path(const char* p) {
     // Only consume the root prefix: collapsing dots later could skip a missing
     // directory, lose a trailing directory requirement, or cross a symlink.
     std::string rooted;
-    if (p && p[0] == '/') {
+    while (p && p[0] == '/') {
         const char* first = p;
         for (;;) {
             while (*first == '/') ++first;
@@ -42285,10 +42471,16 @@ static std::string macapk_arm64_remap_path(const char* p) {
             else break;
         }
         if (first != p + 1) {
-            rooted = "/";
-            rooted += first;
+            rooted = "/" + std::string(first);
             p = rooted.c_str();
         }
+        // The root link denotes the same filesystem view as an absolute path.
+        // Resolve it only for our process; other pids may have a different root.
+        // This is prefix traversal, not lexical ".." normalization.
+        std::string tail;
+        if (!macapk_proc_pid_tail(p, &tail) || tail.rfind("root/", 0) != 0) break;
+        rooted = "/" + tail.substr(5);
+        p = rooted.c_str();
     }
     std::string out = macapk_arm64_remap_path_unguarded(p);
     macapk_store_guard(out);
@@ -42655,6 +42847,7 @@ static std::string macapk_arm64_remap_path_unguarded(const char* p) {
             if (tail == "smaps" && __macapk_arm64_native_full_maps_enabled())
                 return macapk_arm64_smaps_path();
             if (tail == "exe")   return macapk_arm64_exe_path();
+            if (tail == "root")  return macapk_arm64_root_path();
             if (tail == "task" || tail.rfind("task/", 0) == 0)
                 return macapk_arm64_task_path(tail);
             if (tail == "fd" || tail.rfind("fd/", 0) == 0)
@@ -43822,7 +44015,7 @@ static ssize_t macapk_arm64_read_host(int fd, void* buf, size_t n) {
         if (r >= 8 && buf) std::memcpy(&m1, (char*)buf + 4, 4);
         std::fprintf(stderr,
             "[du3d] read fd=%d n=%zu -> %zd (newpos=%lld first8=%08x %08x) ra=%p\n",
-            fd, n, r, (long long)pos, m0, m1, __builtin_return_address(0));
+            fd, n, r, (long long)pos, m0, m1, macapk_original_return_address(__builtin_return_address(0)));
         std::fflush(stderr);
     }
     if (net_tr && is_sock && g_net_trace_n.fetch_add(1) < net_trace_cap()) {
@@ -45100,7 +45293,7 @@ extern "C" int __macapk_arm64_setpriority(int which, int who, int prio) {
             std::fprintf(stderr,
                 "[prio] setpriority(which=%d who=%d nice=%d) -> %s name='%s' ra=%p\n",
                 which, who, prio, have ? "mapped" : "UNMAPPED", nm,
-                __builtin_return_address(0));
+                macapk_original_return_address(__builtin_return_address(0)));
             std::fflush(stderr);
         }
     }
@@ -48626,7 +48819,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 98:  // SYS_futex (uaddr=a1, op=a2, val=a3, timeout=a4)
             return macapk_arm64_futex(a1, int(a2), uint32_t(a3),
                                         reinterpret_cast<const void*>(a4),
-                                        (uint64_t)__builtin_return_address(0));
+                                        (uint64_t)macapk_original_return_address(__builtin_return_address(0)));
         case 113: {  // SYS_clock_gettime (clock_id=a1, struct timespec*=a2)
             // The default case below returns 0 WITHOUT writing the
             // timespec -- if the engine reads its per-frame clock via
@@ -49068,7 +49261,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         // below runs, so the log line and the fetch_add(1) slot count match
         // exactly what an unshimmed nr=64 produced before this case existed).
         case 64:  if (!macapk_router_write_on())
-                      return macapk_router_unimplemented(number, __builtin_return_address(0));
+                      return macapk_router_unimplemented(number, macapk_original_return_address(__builtin_return_address(0)));
                   return (long)macapk_write_host((int)a1, (const void*)macapk_untag_ptr((void*)a2), (size_t)a3);  // write
         case 67:  return (long)::pread((int)a1, (void*)macapk_untag_ptr((void*)a2), (size_t)a3, (off_t)a4);  // pread64
         case 68:  return (long)::pwrite((int)a1, (const void*)a2, (size_t)a3, (off_t)(int64_t)a4);  // pwrite64
@@ -49162,7 +49355,7 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 87:   // timerfd_gettime(fd, curr_value)
             return __macapk_arm64_timerfd_gettime((int)a1, (void*)macapk_untag_ptr((void*)a2));
         default:
-            return macapk_router_unimplemented(number, __builtin_return_address(0));
+            return macapk_router_unimplemented(number, macapk_original_return_address(__builtin_return_address(0)));
     }
 }
 
@@ -50621,7 +50814,7 @@ uint32_t __macapk_shim_fopen(uint32_t path, uint32_t mode,
             const char* sym = "?";
             std::ptrdiff_t off = 0;
             Dl_info info{};
-            void* ret_pc = __builtin_return_address(0);
+            void* ret_pc = macapk_original_return_address(__builtin_return_address(0));
             if (ret_pc && dladdr(ret_pc, &info)) {
                 if (info.dli_sname) sym = info.dli_sname;
                 if (info.dli_saddr)
@@ -55132,7 +55325,7 @@ int32_t __macapk_indirect_call(uint32_t target,
         const char* sym = "?";
         std::ptrdiff_t off = 0;
         Dl_info info{};
-        void* ret_pc = __builtin_return_address(0);
+        void* ret_pc = macapk_original_return_address(__builtin_return_address(0));
         if (ret_pc && dladdr(ret_pc, &info)) {
             if (info.dli_sname) sym = info.dli_sname;
             if (info.dli_saddr) {
@@ -57593,6 +57786,7 @@ extern "C" void* __macapk_arm64_mmap(void* addr, size_t length, int prot,
         && prot == (PROT_READ | PROT_WRITE | PROT_EXEC);
     void* p = mmap(addr, length, fault_wx ? (PROT_READ | PROT_WRITE) : prot,
                    mac_flags, fd, offset);
+    if (p != MAP_FAILED && (mac_flags & MAP_FIXED)) macapk_remove_syscall_guards(uintptr_t(p), length);
     if (p != MAP_FAILED && g_fault_wx_on) {
         // MAP_FIXED replaces an earlier mapping and its logical permissions.
         if (mac_flags & MAP_FIXED) g_fault_wx_pages.remove(uintptr_t(p), length);
@@ -57828,6 +58022,7 @@ extern "C" int __macapk_arm64_libunity_munmap(void* addr, size_t length) {
     // prefault/swallow range.
     macapk_libunity_arena::deregister_reserve(addr);
     int rc = ::munmap(addr, length);
+    if (rc == 0) macapk_remove_syscall_guards(uintptr_t(addr), length);
     if (rc == 0 && g_fault_wx_on) g_fault_wx_pages.remove(uintptr_t(addr), length);
     return rc;
 }
@@ -57935,6 +58130,8 @@ bool macapk_range_hits_host_exec(uintptr_t lo, uintptr_t hi) {
 }
 } // namespace
 
+extern "C" uintptr_t __macapk_create_execution_shadow(uintptr_t);
+extern "C" bool __macapk_refresh_execution_shadow(uintptr_t, uintptr_t);
 static void macapk_prepare_dynamic_syscalls(void* addr, size_t len, int prot) {
     static const bool enabled = [] {
         const char* e = std::getenv("MACAPK_DYNAMIC_SVC_BRK");
@@ -57958,6 +58155,25 @@ static void macapk_prepare_dynamic_syscalls(void* addr, size_t len, int prot) {
             || len > size - (start - region)
             || (info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE))
                 != (VM_PROT_READ | VM_PROT_WRITE)) return;
+    if (std::getenv("MACAPK_DYNAMIC_SVC_SHADOW") && !(start & 0x3fff) && len <= 0x4000) {
+        int n = g_sc_guard_n.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            const auto& g = g_sc_guards[i];
+            if (g_sc_guard_live[i].load(std::memory_order_acquire) && g.lo == start) {
+                if (g.dynamic) __macapk_refresh_execution_shadow(start, g.shadow);
+                return;
+            }
+        }
+        std::vector<uint32_t> probe(static_cast<uint32_t*>(addr), static_cast<uint32_t*>(addr) + len / 4);
+        if (!macapk::a64::rewrite_dynamic_syscalls(probe)) return;
+        uintptr_t shadow = __macapk_create_execution_shadow(start);
+        if (shadow && !macapk_register_syscall_guard(start, start + 0x4000, shadow, 0, true)) {
+            mach_vm_deallocate(mach_task_self(), shadow, 0xc000);
+            shadow = 0;
+        }
+        std::fprintf(stderr, "[dynamic-shadow] original=%p execution=%p\n", addr, reinterpret_cast<void*>(shadow));
+        return;
+    }
     size_t changed = macapk::a64::rewrite_dynamic_syscalls(
         std::span(static_cast<uint32_t*>(addr), len / sizeof(uint32_t)));
     if (changed) {
@@ -57967,6 +58183,7 @@ static void macapk_prepare_dynamic_syscalls(void* addr, size_t len, int prot) {
     }
 }
 
+extern "C" bool __macapk_refresh_execution_shadow(uintptr_t, uintptr_t);
 extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     // Guard: the guest must never re-protect OUR host code. If the requested
     // range overlaps a host executable segment we refuse it (report success,
@@ -57987,7 +58204,7 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
                     "[mprotect-guard] guest mprotect(%p,%zu,0x%x) overlaps HOST "
                     "executable code -- %s (caller ra=%p)\n",
                     addr, len, prot, guard_off ? "APPLYING (guard off)" : "EACCES",
-                    __builtin_return_address(0));
+                    macapk_original_return_address(__builtin_return_address(0)));
                 std::fflush(stderr);
             }
             // Return a FAILURE (as a real device would for a W^X-forbidden code
@@ -58024,6 +58241,19 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
     int rc = ::mprotect(addr, len, fault_wx ? (PROT_READ | PROT_WRITE) : prot);
     if (g_fault_wx_on && ((rc == 0 && !make_writable) || (rc != 0 && fault_wx)))
         g_fault_wx_pages.remove(uintptr_t(addr), len);
+    if (rc == 0 && close_window && std::getenv("MACAPK_TPIDR_SHADOW")) {
+        uintptr_t lo = uintptr_t(addr), hi = lo + len;
+        int n = g_sc_guard_n.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            const auto& g = g_sc_guards[i];
+            if (!g_sc_guard_live[i].load(std::memory_order_acquire) || g.wrapper || g.lo >= hi || g.hi <= lo) continue;
+            if (::mprotect(reinterpret_cast<void*>(g.lo), g.hi - g.lo, prot & ~PROT_EXEC) ||
+                !__macapk_refresh_execution_shadow(g.lo, g.shadow)) {
+                rc = -1;
+                break;
+            }
+        }
+    }
     // v1.0.586 W^X JIT compat: macOS Apple Silicon forbids PERSISTENT RWX (an
     // mprotect to R+W+X fails). Android JIT engines (cohtml's V8, which renders
     // MCPE's Ore-UI menu) request RWX to UNPROTECT a code page for writing --
@@ -59544,7 +59774,7 @@ static void macapk_jni_null_recv_log(const char* which) {
             return (RET)0;                                                    \
         }                                                                     \
         if (!macapk_bridge_passthrough()                                    \
-            && caller_is_bionic(__builtin_return_address(0))) {               \
+            && caller_is_bionic(macapk_original_return_address(__builtin_return_address(0)))) {               \
             /* The buffer MUST be sized from the SIGNATURE, not fixed.        \
                It used to be a flat jvalue[16] and the packer stopped at 16,   \
                silently DROPPING later arguments -- but HotSpot's *A variant   \
@@ -60138,7 +60368,7 @@ jsize macapk_jni_GetStringLength_guard(JNIEnv* env, jstring s) {
     // actually be logged (guest caller, within the sample), so no cost on the
     // normal path. Reads via the ORIGINAL slot to avoid re-entering this guard.
     if (std::getenv("MACAPK_JNI_STR_CONTENT") && g_orig_GetStringChars && s && len > 0) {
-        void* ra = __builtin_return_address(0);
+        void* ra = macapk_original_return_address(__builtin_return_address(0));
         typedef int (*in_img_fn)(const void*);
         static in_img_fn s_in_img = reinterpret_cast<in_img_fn>(
             dlsym(RTLD_DEFAULT, "__macapk_arm64_native_addr_in_image"));
@@ -60150,7 +60380,7 @@ jsize macapk_jni_GetStringLength_guard(JNIEnv* env, jstring s) {
             return len;
         }
     }
-    macapk_jni_str_content_log("GetStringLength", __builtin_return_address(0),
+    macapk_jni_str_content_log("GetStringLength", macapk_original_return_address(__builtin_return_address(0)),
                                s, len, /*have_len=*/1, nullptr, 0);
     return len;
 }
@@ -60181,7 +60411,7 @@ const jchar* macapk_jni_GetStringCritical_guard(JNIEnv* env, jstring s,
     // No length here (must not call another JNI fn inside a GetStringCritical
     // region) and no char read (unbounded); the length datum is logged in the
     // GetStringLength guard, which the same loop also calls.
-    macapk_jni_str_content_log("GetStringCritical", __builtin_return_address(0),
+    macapk_jni_str_content_log("GetStringCritical", macapk_original_return_address(__builtin_return_address(0)),
                                s, 0, /*have_len=*/0, nullptr, is_copy ? *is_copy : 0);
     return r;
 }
@@ -60304,7 +60534,7 @@ static bool calling_thread_is_detached() {
 }
 
 void macapk_jni_DeleteGlobalRef_guard(JNIEnv* env, jobject ref) {
-    if (caller_is_bionic(__builtin_return_address(0))
+    if (caller_is_bionic(macapk_original_return_address(__builtin_return_address(0)))
         && calling_thread_is_detached()) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 8)
@@ -60317,7 +60547,7 @@ void macapk_jni_DeleteGlobalRef_guard(JNIEnv* env, jobject ref) {
 }
 
 void macapk_jni_DeleteLocalRef_guard(JNIEnv* env, jobject ref) {
-    if (caller_is_bionic(__builtin_return_address(0))
+    if (caller_is_bionic(macapk_original_return_address(__builtin_return_address(0)))
         && calling_thread_is_detached()) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 8)
@@ -62637,6 +62867,28 @@ struct AttachGuard {
 };
 }  // namespace
 
+#include "native_texture_window.inc"
+static void* macapk_texture_egl_create(void* dpy, void* config, void* win,
+                                      const int32_t* attribs, bool* handled) {
+    if (!macapk_texture_windows_enabled()) return nullptr;
+    AttachGuard ag;
+    jobject surface = ag.env ? macapk_texture_window_surface(ag.env, win) : nullptr;
+    if (!surface) return nullptr;
+    *handled = true;
+    using Create = void* (*)(JNIEnv*, void*, void*, jobject, const int32_t*);
+    static auto create = reinterpret_cast<Create>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_create"));
+    void* result = create ? create(ag.env, dpy, config, surface, attribs) : nullptr;
+    ag.env->DeleteLocalRef(surface);
+    return result;
+}
+static int macapk_texture_egl_destroy(void* dpy, void* surf) {
+    using Destroy = int (*)(JNIEnv*, void*, void*);
+    static auto destroy = reinterpret_cast<Destroy>(dlsym(RTLD_DEFAULT, "__macapk_egl14_window_destroy"));
+    if (!destroy) return -1;
+    AttachGuard ag;
+    return ag.env ? destroy(ag.env, dpy, surf) : -1;
+}
+
 // ---- The native asset index over the installed APK set --------------------
 namespace {
 struct NativeZipEntry {
@@ -64427,6 +64679,7 @@ alignas(16) static uint8_t g_macapk_dummy_ANativeWindow[4096] = {0};
 // render targets from. The literal is only a last resort for a query that
 // arrives before any window exists at all.
 extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
+    if (int n = macapk_texture_window_size(w, true); n >= 0) return n;
     if (macapk_is_unity_window(w)) return g_macapk_unity_window.width;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.width > 0) {
@@ -64435,6 +64688,7 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getWidth(void* w) {
     return 1080;
 }
 extern "C" int32_t __macapk_arm64_ANativeWindow_getHeight(void* w) {
+    if (int n = macapk_texture_window_size(w, false); n >= 0) return n;
     if (macapk_is_unity_window(w)) return g_macapk_unity_window.height;
     if (g_macapk_unity_window.magic == kMacApkNWMagic
         && g_macapk_unity_window.height > 0) {
@@ -64468,8 +64722,8 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_setBuffersGeometry(
                      set_geo ? "" : " -- no Cocoa bridge, ignored");
     return 0;
 }
-extern "C" void __macapk_arm64_ANativeWindow_release(void* /*w*/) {}
-extern "C" void __macapk_arm64_ANativeWindow_acquire(void* /*w*/) {}
+extern "C" void __macapk_arm64_ANativeWindow_release(void* w) { macapk_texture_window_ref(w, false); }
+extern "C" void __macapk_arm64_ANativeWindow_acquire(void* w) { macapk_texture_window_ref(w, true); }
 // The Java Surface the guest handed to ANativeWindow_fromSurface, kept as a
 // JNI GLOBAL ref so ANativeWindow_toSurface can hand the SAME object back.
 // NDK native_window_jni.h documents toSurface as the exact inverse of
@@ -64517,6 +64771,15 @@ static void macapk_remember_native_window_surface(jobject surface) {
 }
 extern "C" void* __macapk_arm64_ANativeWindow_fromSurface(
         void* /*env*/, void* surface) {
+    if (macapk_texture_windows_enabled()) {
+        AttachGuard ag;
+        if (ag.env) {
+            bool handled = false;
+            void* w = macapk_texture_window_from_surface(ag.env, reinterpret_cast<jobject>(surface), &handled);
+            if (handled) return w;
+            if (ag.env->ExceptionCheck()) return nullptr;
+        }
+    }
     macapk_remember_native_window_surface(reinterpret_cast<jobject>(surface));
     // v1.0.162: return a real ANativeWindow backed by the Cocoa
     // CAMetalLayer (pre-created on the main thread in drawInMTKView for
@@ -64580,16 +64843,13 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_getFormat(void* w) {
 // NULL when no real Surface ever arrived, which is the documented answer for a
 // window that has no Java counterpart.
 extern "C" void* __macapk_arm64_ANativeWindow_toSurface(void* /*env*/,
-                                                        void* /*w*/) {
-    jobject gref = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
-        gref = g_macapk_nw_surface_gref;
-    }
-    if (!gref) return nullptr;
+                                                        void* w) {
     AttachGuard ag;
     if (!ag.env) return nullptr;
-    jobject local = ag.env->NewLocalRef(gref);
+    if (jobject surface = macapk_texture_window_surface(ag.env, w)) return surface;
+    std::lock_guard<std::mutex> lk(g_macapk_nw_surface_mu);
+    if (!g_macapk_nw_surface_gref) return nullptr;
+    jobject local = ag.env->NewLocalRef(g_macapk_nw_surface_gref);
     if (!local && ag.env->ExceptionCheck()) ag.env->ExceptionClear();
     return local;
 }
@@ -64647,7 +64907,10 @@ extern "C" int32_t __macapk_arm64_ANativeWindow_lock(
     catch (const std::exception&) { return -ENOMEM; }
     AttachGuard ag;
     if (!ag.env || ag.env->ExceptionCheck()) return -EINVAL;
-    {
+    if (jobject surface = macapk_texture_window_surface(ag.env, w)) {
+        g_anw_locked_surface = ag.env->NewGlobalRef(surface);
+        ag.env->DeleteLocalRef(surface);
+    } else {
         std::lock_guard<std::mutex> surface_lk(g_macapk_nw_surface_mu);
         if (g_macapk_nw_surface_gref)
             g_anw_locked_surface = ag.env->NewGlobalRef(g_macapk_nw_surface_gref);
@@ -65523,7 +65786,7 @@ extern "C" void* __macapk_arm64_ALooper_forThread() {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 16) { uint64_t tid=0; pthread_threadid_np(nullptr,&tid);
             std::fprintf(stderr, "[looper] ALooper_forThread tid=%llu ra=%p L=%p\n",
-                (unsigned long long)tid, __builtin_return_address(0), L); std::fflush(stderr); }
+                (unsigned long long)tid, macapk_original_return_address(__builtin_return_address(0)), L); std::fflush(stderr); }
     }
     return L;
 }
@@ -65533,7 +65796,7 @@ extern "C" void* __macapk_arm64_ALooper_prepare(int /*opts*/) {
         static std::atomic<int> n{0};
         if (n.fetch_add(1) < 16) { uint64_t tid=0; pthread_threadid_np(nullptr,&tid);
             std::fprintf(stderr, "[looper] ALooper_prepare tid=%llu ra=%p L=%p\n",
-                (unsigned long long)tid, __builtin_return_address(0), L); std::fflush(stderr); }
+                (unsigned long long)tid, macapk_original_return_address(__builtin_return_address(0)), L); std::fflush(stderr); }
     }
     return L;
 }
@@ -66804,12 +67067,12 @@ static ssize_t macapk_process_vm_rw(pid_t pid, const void* lvec, unsigned long l
 extern "C" ssize_t __macapk_arm64_process_vm_readv(
         pid_t pid, const void* lvec, unsigned long lcnt,
         const void* rvec, unsigned long rcnt, unsigned long flags) {
-    return macapk_process_vm_rw(pid, lvec, lcnt, rvec, rcnt, flags, false, __builtin_return_address(0));
+    return macapk_process_vm_rw(pid, lvec, lcnt, rvec, rcnt, flags, false, macapk_original_return_address(__builtin_return_address(0)));
 }
 extern "C" ssize_t __macapk_arm64_process_vm_writev(
         pid_t pid, const void* lvec, unsigned long lcnt,
         const void* rvec, unsigned long rcnt, unsigned long flags) {
-    return macapk_process_vm_rw(pid, lvec, lcnt, rvec, rcnt, flags, true, __builtin_return_address(0));
+    return macapk_process_vm_rw(pid, lvec, lcnt, rvec, rcnt, flags, true, macapk_original_return_address(__builtin_return_address(0)));
 }
 
 // __gnu_strerror_r: GNU-flavor strerror_r returning char* (not int).

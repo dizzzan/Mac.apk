@@ -86,8 +86,8 @@
 // the protection pass does not re-flip them R-X). File scope so both macapk_setup_syscall_guard_page
 // and the loader's post-protections step see them. An array because one image can hold more than
 // one wrapper page. See docs/pairip-text-selfhash-root-cause.
-static uintptr_t g_pending_guard_strip_lo[8] = {0};
-static size_t    g_pending_guard_strip_sz[8] = {0};
+static uintptr_t g_pending_guard_strip_lo[4096] = {0};
+static size_t    g_pending_guard_strip_sz[4096] = {0};
 static int       g_pending_guard_strip_n = 0;
 #include <unordered_set>
 #include <vector>
@@ -295,21 +295,25 @@ __attribute__((naked)) static uint64_t macapk_x18_probe_get(void) {
 // This is a faithful-platform-surface fix, app-agnostic: every Bionic guest expects a real
 // x18. Gated while it is measured; the sentinel is the status quo it replaces.
 extern "C" unsigned long __stack_chk_guard;
+extern "C" void* __macapk_guest_thread_pointer() {
+    static thread_local void** s_tls = nullptr;
+    if (!s_tls) {
+        void** blk = static_cast<void**>(std::calloc(64, sizeof(void*)));
+        if (!blk) return nullptr;
+        blk[1] = reinterpret_cast<void*>(pthread_self());
+        blk[5] = reinterpret_cast<void*>(__stack_chk_guard);
+        s_tls = blk;
+    }
+    return s_tls;
+}
 static void macapk_x18_install_guest_tls() {
     static const bool s_on = [] {
         const char* e = std::getenv("MACAPK_GUEST_TLS");
         return !(e && e[0] == '0');          // default ON; MACAPK_GUEST_TLS=0 restores the sentinel
     }();
     if (!s_on) return;
-    static thread_local void** s_tls = nullptr;
-    if (!s_tls) {
-        void** blk = static_cast<void**>(std::calloc(64, sizeof(void*)));
-        if (!blk) return;
-        blk[1] = reinterpret_cast<void*>(pthread_self());        // TLS_SLOT_THREAD_ID
-        blk[5] = reinterpret_cast<void*>(__stack_chk_guard);     // TLS_SLOT_STACK_GUARD (x18+0x28)
-        s_tls = blk;
-    }
-    macapk_x18_probe_set(reinterpret_cast<uint64_t>(s_tls));     // set x18 LAST
+    void* tls = __macapk_guest_thread_pointer();
+    if (tls) macapk_x18_probe_set(reinterpret_cast<uint64_t>(tls)); // set x18 LAST
 }
 
 // true iff guest x18 will actually survive on this host. Memoized: the probe
@@ -1614,7 +1618,10 @@ bool Image::map_segments(const uint8_t* blob, size_t blob_size, int so_fd) {
     // Anonymous RW mapping for the whole span; we'll mprotect per
     // segment later. Reserve the shift pad up front so the image still fits.
     size_t image_reservation = align_up(mapped_size_ + bias_shift, page_size_);
-    if (std::getenv("MACAPK_SYSCALL_TEXT_SHADOW")) svc_shadow_reserve_size_ = page_size_ * 3;
+    if (std::getenv("MACAPK_SYSCALL_TEXT_SHADOW"))
+        svc_shadow_reserve_size_ = std::getenv("MACAPK_LINKED_SHADOWS") ? (std::getenv("MACAPK_SHADOW_HOST_RETURN") ? 9 : 5) * image_reservation
+                                : std::getenv("MACAPK_TPIDR_SHADOW") ? 3 * image_reservation
+            : page_size_ * 3 * (std::getenv("MACAPK_SVC_SHADOW_ALL") ? 32 : 1);
     map_len_ = image_reservation + svc_shadow_reserve_size_;
     // MACAPK_PAIRIP_HIVA (DIAGNOSTIC, default OFF, 2026-09-12): bias guest ELF loads to the
     // Android high-VA range (~0x7x_________) instead of the macOS-default low VA (~0x1________).
@@ -11589,23 +11596,350 @@ bool macapk_setup_syscall_guard_page(uintptr_t wrapper_va, uintptr_t base,
 // This is deliberately opt-in until LR-derived addresses and cross-page
 // indirect transfers have a complete relocation contract.
 extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+// Execution-copy MRS helper: preserve every register and NZCV except x16,
+// which carries the thread pointer back to a short register-selecting veneer.
+// SIMD upper halves are caller-clobbered by AAPCS64, so save all 128 bits.
+extern "C" __attribute__((naked)) void __macapk_shadow_tls_preserve() {
+    __asm__ volatile(
+        "sub sp, sp, #688\n"
+        "stp x0, x1, [sp, #0]\n"
+        "stp x2, x3, [sp, #16]\n"
+        "stp x4, x5, [sp, #32]\n"
+        "stp x6, x7, [sp, #48]\n"
+        "stp x8, x9, [sp, #64]\n"
+        "stp x10, x11, [sp, #80]\n"
+        "stp x12, x13, [sp, #96]\n"
+        "stp x14, x15, [sp, #112]\n"
+        "stp x17, x18, [sp, #128]\n"
+        "stp x29, x30, [sp, #144]\n"
+        "mrs x17, nzcv\n"
+        "str x17, [sp, #160]\n"
+        "mrs x17, fpcr\n"
+        "mrs x0, fpsr\n"
+        "orr x17, x17, x0, lsl #32\n"
+        "str x17, [sp, #168]\n"
+        "stp q0, q1, [sp, #176]\n"
+        "stp q2, q3, [sp, #208]\n"
+        "stp q4, q5, [sp, #240]\n"
+        "stp q6, q7, [sp, #272]\n"
+        "stp q8, q9, [sp, #304]\n"
+        "stp q10, q11, [sp, #336]\n"
+        "stp q12, q13, [sp, #368]\n"
+        "stp q14, q15, [sp, #400]\n"
+        "stp q16, q17, [sp, #432]\n"
+        "stp q18, q19, [sp, #464]\n"
+        "stp q20, q21, [sp, #496]\n"
+        "stp q22, q23, [sp, #528]\n"
+        "stp q24, q25, [sp, #560]\n"
+        "stp q26, q27, [sp, #592]\n"
+        "stp q28, q29, [sp, #624]\n"
+        "stp q30, q31, [sp, #656]\n"
+        "bl ___macapk_guest_thread_pointer\n"
+        "mov x16, x0\n"
+        "ldp q0, q1, [sp, #176]\n"
+        "ldp q2, q3, [sp, #208]\n"
+        "ldp q4, q5, [sp, #240]\n"
+        "ldp q6, q7, [sp, #272]\n"
+        "ldp q8, q9, [sp, #304]\n"
+        "ldp q10, q11, [sp, #336]\n"
+        "ldp q12, q13, [sp, #368]\n"
+        "ldp q14, q15, [sp, #400]\n"
+        "ldp q16, q17, [sp, #432]\n"
+        "ldp q18, q19, [sp, #464]\n"
+        "ldp q20, q21, [sp, #496]\n"
+        "ldp q22, q23, [sp, #528]\n"
+        "ldp q24, q25, [sp, #560]\n"
+        "ldp q26, q27, [sp, #592]\n"
+        "ldp q28, q29, [sp, #624]\n"
+        "ldp q30, q31, [sp, #656]\n"
+        "ldr x17, [sp, #168]\n"
+        "lsr x0, x17, #32\n"
+        "msr fpsr, x0\n"
+        "msr fpcr, x17\n"
+        "ldr x17, [sp, #160]\n"
+        "msr nzcv, x17\n"
+        "ldp x29, x30, [sp, #144]\n"
+        "ldp x17, x18, [sp, #128]\n"
+        "ldp x0, x1, [sp, #0]\n"
+        "ldp x2, x3, [sp, #16]\n"
+        "ldp x4, x5, [sp, #32]\n"
+        "ldp x6, x7, [sp, #48]\n"
+        "ldp x8, x9, [sp, #64]\n"
+        "ldp x10, x11, [sp, #80]\n"
+        "ldp x12, x13, [sp, #96]\n"
+        "ldp x14, x15, [sp, #112]\n"
+        "add sp, sp, #688\n"
+        "ret\n"
+    );
+}
+extern "C" uintptr_t __macapk_shadow_landing_for(uintptr_t);
+extern "C" uintptr_t __macapk_shadow_code_for(uintptr_t);
+extern "C" void __macapk_set_shadow_landing(uintptr_t, uintptr_t, uintptr_t);
+extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t, uintptr_t*);
+extern "C" __attribute__((naked)) void __macapk_shadow_branch_preserve() {
+    __asm__ volatile(
+        "sub sp, sp, #688\n"
+        "stp x0, x1, [sp, #0]\n"
+        "stp x2, x3, [sp, #16]\n"
+        "stp x4, x5, [sp, #32]\n"
+        "stp x6, x7, [sp, #48]\n"
+        "stp x8, x9, [sp, #64]\n"
+        "stp x10, x11, [sp, #80]\n"
+        "stp x12, x13, [sp, #96]\n"
+        "stp x14, x15, [sp, #112]\n"
+        "stp x17, x18, [sp, #128]\n"
+        "stp x29, x30, [sp, #144]\n"
+        "mrs x17, nzcv\n"
+        "str x17, [sp, #160]\n"
+        "mrs x17, fpcr\n"
+        "mrs x0, fpsr\n"
+        "orr x17, x17, x0, lsl #32\n"
+        "str x17, [sp, #168]\n"
+        "stp q0, q1, [sp, #176]\n"
+        "stp q2, q3, [sp, #208]\n"
+        "stp q4, q5, [sp, #240]\n"
+        "stp q6, q7, [sp, #272]\n"
+        "stp q8, q9, [sp, #304]\n"
+        "stp q10, q11, [sp, #336]\n"
+        "stp q12, q13, [sp, #368]\n"
+        "stp q14, q15, [sp, #400]\n"
+        "stp q16, q17, [sp, #432]\n"
+        "stp q18, q19, [sp, #464]\n"
+        "stp q20, q21, [sp, #496]\n"
+        "stp q22, q23, [sp, #528]\n"
+        "stp q24, q25, [sp, #560]\n"
+        "stp q26, q27, [sp, #592]\n"
+        "stp q28, q29, [sp, #624]\n"
+        "stp q30, q31, [sp, #656]\n"
+        "mov x0, x16\n"
+        "add x1, sp, #696\n"
+        "bl ___macapk_shadow_branch_target\n"
+        "mov x16, x0\n"
+        "ldp q0, q1, [sp, #176]\n"
+        "ldp q2, q3, [sp, #208]\n"
+        "ldp q4, q5, [sp, #240]\n"
+        "ldp q6, q7, [sp, #272]\n"
+        "ldp q8, q9, [sp, #304]\n"
+        "ldp q10, q11, [sp, #336]\n"
+        "ldp q12, q13, [sp, #368]\n"
+        "ldp q14, q15, [sp, #400]\n"
+        "ldp q16, q17, [sp, #432]\n"
+        "ldp q18, q19, [sp, #464]\n"
+        "ldp q20, q21, [sp, #496]\n"
+        "ldp q22, q23, [sp, #528]\n"
+        "ldp q24, q25, [sp, #560]\n"
+        "ldp q26, q27, [sp, #592]\n"
+        "ldp q28, q29, [sp, #624]\n"
+        "ldp q30, q31, [sp, #656]\n"
+        "ldr x17, [sp, #168]\n"
+        "lsr x0, x17, #32\n"
+        "msr fpsr, x0\n"
+        "msr fpcr, x17\n"
+        "ldr x17, [sp, #160]\n"
+        "msr nzcv, x17\n"
+        "ldp x29, x30, [sp, #144]\n"
+        "ldp x17, x18, [sp, #128]\n"
+        "ldp x0, x1, [sp, #0]\n"
+        "ldp x2, x3, [sp, #16]\n"
+        "ldp x4, x5, [sp, #32]\n"
+        "ldp x6, x7, [sp, #48]\n"
+        "ldp x8, x9, [sp, #64]\n"
+        "ldp x10, x11, [sp, #80]\n"
+        "ldp x12, x13, [sp, #96]\n"
+        "ldp x14, x15, [sp, #112]\n"
+        "add sp, sp, #688\n"
+        "ret\n"
+    );
+}
+static bool macapk_shadow_indirects(std::span<const uint32_t> original,
+                                    std::vector<uint32_t>& code, uintptr_t original_base) {
+    for (size_t i=0; i<original.size(); ++i) {
+        uint32_t w = original[i];
+        bool call = (w & 0xfffffc1fu) == 0xd63f0000u;
+        if (!call && (w & 0xfffffc1fu) != 0xd61f0000u && (w & 0xfffffc1fu) != 0xd65f0000u) continue;
+        unsigned rn = (w >> 5) & 31;
+        if (rn == 31) continue;
+        if (call && rn == 30) return false;
+        size_t start = code.size();
+        code[i] = 0x14000000u | uint32_t(start - i);
+        code.push_back(0xa9bf7bf0u); // stp x16,x30,[sp,#-16]!
+        code.push_back(0xaa0003f0u | (rn << 16)); // mov x16,Xn
+        size_t lr_load=0;
+        if (call) {
+            lr_load=code.size();code.push_back(0);
+            code.push_back(0xf90007feu); // str LR,[sp,#8]: original call return
+        }
+        size_t load = code.size(); code.push_back(0);
+        code.push_back(0xd63f03c0u); // blr x30
+        code.push_back(0xb4000050u); // cbz x16,+8 (untranslated destination)
+        code.push_back(0xd61f0200u); // br x16; landing restores x16/LR
+        code.push_back(0xa8c17bf0u); // fallback: ldp x16,x30,[sp],#16
+        code.push_back(call ? (0xd61f0000u | (rn << 5)) : w);
+        code[load] = 0x5800001eu | (uint32_t(code.size()-load) << 5);
+        uintptr_t fn = reinterpret_cast<uintptr_t>(&__macapk_shadow_branch_preserve);
+        code.push_back(uint32_t(fn)); code.push_back(uint32_t(fn >> 32));
+        if (call) {
+            code[lr_load]=0x5800001eu|(uint32_t(code.size()-lr_load)<<5);
+            uintptr_t lr=original_base+i*4+4;
+            code.push_back(uint32_t(lr));code.push_back(uint32_t(lr>>32));
+        }
+    }
+    return code.size()*4 <= 0xc000;
+}
+
+static bool macapk_shadow_tls(std::vector<uint32_t>& code, size_t index, uintptr_t shadow, unsigned rt) {
+    if (!std::getenv("MACAPK_TPIDR_SHADOW_CALL")) {
+        code[index] = 0xd4200000u | ((0x4d80u | rt) << 5);
+        return true;
+    }
+    if (rt == 31) { code[index] = 0xd503201fu; return true; }
+    // stp saves guest x16/LR before BLR enters the all-register helper.
+    size_t thunk = code.size();
+    code[index] = 0x14000000u | uint32_t(thunk - index);
+    code.push_back(0xa9bf7bf0u); // stp x16,x30,[sp,#-16]!
+    size_t literalLoad = code.size(); code.push_back(0);
+    code.push_back(0xd63f0200u); // blr x16
+    code.push_back(0xaa1003e0u | rt); // mov Xt,x16
+    if (rt == 16 || rt == 30) {
+        code.push_back(rt == 16 ? 0xf94007feu : 0xf94003f0u);
+        code.push_back(0x910043ffu); // add sp,sp,#16
+    } else code.push_back(0xa8c17bf0u); // ldp x16,x30,[sp],#16
+    size_t leave = code.size();
+    code.push_back(0x14000000u | (uint32_t(index + 1 - leave) & 0x03ffffffu));
+    code[literalLoad] = 0x58000010u | (uint32_t(code.size() - literalLoad) << 5);
+    uintptr_t helper = reinterpret_cast<uintptr_t>(&__macapk_shadow_tls_preserve);
+    code.push_back(uint32_t(helper)); code.push_back(uint32_t(helper >> 32));
+    return code.size() * 4 <= 0xc000;
+}
+extern "C" bool __macapk_refresh_execution_shadow(uintptr_t original, uintptr_t shadow) {
+    constexpr size_t page = 0x4000, allocation = page * 3;
+    std::span<const uint32_t> source(reinterpret_cast<const uint32_t*>(original), page / 4);
+    std::vector<uint32_t> code;
+    bool linked = __macapk_shadow_landing_for(original) != 0;
+    std::function<uint64_t(uint64_t)> resolve;
+    if (linked) resolve = [](uint64_t pc) { return __macapk_shadow_code_for(pc); };
+    if (!macapk::a64::relocate_shadow_page(source, original, shadow, code, nullptr, nullptr, true, std::getenv("MACAPK_SHADOW_ORIGINAL_LR"), resolve) ||
+        code.size() * 4 > allocation) return false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        if (source[i] == 0xd4000001u) code[i] = 0xd4200000u | (0x4d41u << 5);
+        else if ((source[i] & 0xffffffe0u) == 0xd53bd040u)
+            if (!macapk_shadow_tls(code, i, shadow, source[i] & 31u)) return false;
+    }
+    if (linked && !macapk_shadow_indirects(source,code,original)) return false;
+    macapk::a64::omit_unsupported_vfork_pid_cache(code);
+    if (mprotect(reinterpret_cast<void*>(shadow), allocation, PROT_READ | PROT_WRITE)) return false;
+    std::memcpy(reinterpret_cast<void*>(shadow), code.data(), code.size() * 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(shadow), code.size() * 4);
+    return mprotect(reinterpret_cast<void*>(shadow), allocation, PROT_READ | PROT_EXEC) == 0;
+}
+extern "C" uintptr_t __macapk_create_execution_shadow(uintptr_t original) {
+    constexpr size_t page = 0x4000, allocation = page * 3;
+    for (uintptr_t delta = allocation; delta < (64u << 20); delta += allocation) {
+        for (int direction : {1, -1}) {
+            mach_vm_address_t address = original + direction * delta;
+            if (mach_vm_allocate(mach_task_self(), &address, allocation, VM_FLAGS_FIXED) != KERN_SUCCESS) continue;
+            if (__macapk_refresh_execution_shadow(original, address)) return address;
+            mach_vm_deallocate(mach_task_self(), address, allocation);
+        }
+    }
+    mach_vm_address_t address = 0;
+    if (mach_vm_allocate(mach_task_self(), &address, allocation, VM_FLAGS_ANYWHERE) == KERN_SUCCESS) {
+        if (__macapk_refresh_execution_shadow(original, address)) return address;
+        mach_vm_deallocate(mach_task_self(), address, allocation);
+    }
+    return 0;
+}
 size_t Image::apply_svc_shadow_pages() {
     if (!std::getenv("MACAPK_SYSCALL_TEXT_SHADOW")) return 0;
     constexpr size_t page_size = 0x4000, allocation_size = page_size * 3;
     constexpr uint32_t shuffle[] = {0xaa0003e8, 0xaa0103e0, 0xaa0203e1,
                                     0xaa0303e2, 0xaa0403e3, 0xaa0503e4, 0xaa0603e5};
     constexpr uint32_t brk = 0xd4200000u | (0x4d41u << 5), svc = 0xd4000001;
+    const bool all_svc = std::getenv("MACAPK_SVC_SHADOW_ALL") != nullptr;
+    const bool tls_shadow = all_svc && std::getenv("MACAPK_TPIDR_SHADOW");
     std::map<uintptr_t, std::vector<uint32_t*>> pages;
     for (auto sg : segments_) {
         if (!(sg.prot & PROT_EXEC) || sg.memsz < sizeof(shuffle) + 4) continue;
         auto* p = reinterpret_cast<uint32_t*>(sg.vaddr);
-        for (size_t i = 7; i < sg.memsz / 4; ++i) {
-            if (p[i] != brk || std::memcmp(p + i - 7, shuffle, sizeof(shuffle))) continue;
+        for (size_t i = all_svc ? 0 : 7; i < sg.memsz / 4; ++i) {
+            if ((p[i] != brk && !(all_svc && p[i] == svc) &&
+                 !(tls_shadow && (p[i] & 0xffffffe0u) == 0xd53bd040u)) ||
+                (!all_svc && std::memcmp(p + i - 7, shuffle, sizeof(shuffle)))) continue;
             uintptr_t page = reinterpret_cast<uintptr_t>(p + i) & ~(page_size - 1);
             if (page < reinterpret_cast<uintptr_t>(base_) ||
                 page + page_size > reinterpret_cast<uintptr_t>(base_) + mapped_size_) continue;
             pages[page].push_back(p + i);
         }
+    }
+    if (std::getenv("MACAPK_LINKED_SHADOWS")) {
+        for (auto sg : segments_) if (sg.prot & PROT_EXEC) {
+            uintptr_t lo = sg.vaddr & ~(uintptr_t(page_size)-1);
+            uintptr_t hi = (sg.vaddr + sg.memsz + page_size-1) & ~(uintptr_t(page_size)-1);
+            for (uintptr_t page=lo; page<hi; page+=page_size) pages.try_emplace(page);
+        }
+        const bool host_returns = std::getenv("MACAPK_SHADOW_HOST_RETURN") != nullptr;
+        const size_t stride = (host_returns ? 9 : 5) * page_size;
+        if (svc_shadow_reserve_size_ < pages.size()*stride) return 0;
+        std::map<uintptr_t, uintptr_t> targets;
+        size_t slot=0;
+        for (const auto& [page, sites] : pages) targets[page] = svc_shadow_reserve_ + slot++ * stride;
+        std::map<uintptr_t, std::vector<uint32_t>> copies;
+        auto resolve = [&](uint64_t pc) -> uint64_t {
+            auto i=targets.find(pc & ~(uint64_t(page_size)-1));
+            return i == targets.end() ? pc : i->second + (pc & (page_size-1));
+        };
+        bool removed;
+        do {
+            removed = false; copies.clear();
+            for (auto it=targets.begin(); it!=targets.end();) {
+                uintptr_t page=it->first, shadow=it->second;
+                std::span<const uint32_t> words(reinterpret_cast<const uint32_t*>(page),page_size/4);
+                auto& code=copies[page];
+                bool ok=macapk::a64::relocate_shadow_page(words,page,shadow,code,nullptr,nullptr,true,true,resolve);
+                if (ok) for (uint32_t* site : pages[page]) {
+                    size_t offset=(reinterpret_cast<uintptr_t>(site)-page)/4;
+                    if ((*site & 0xffffffe0u)==0xd53bd040u) ok=macapk_shadow_tls(code,offset,shadow,*site & 31u) && ok;
+                    else code[offset]=brk;
+                }
+                if (ok) ok=macapk_shadow_indirects(words,code,page);
+                if (!ok) { copies.erase(page);it=targets.erase(it);removed=true; }
+                else ++it;
+            }
+        } while (removed);
+        size_t count=0;
+        for (const auto& [page, shadow] : targets) {
+            const auto& code=copies[page];
+            std::memcpy(reinterpret_cast<void*>(shadow),code.data(),code.size()*4);
+            auto* landings=reinterpret_cast<uint32_t*>(shadow+3*page_size);
+            for(size_t i=0;i<page_size/4;++i) {
+                landings[i*2]=0xa8c17bf0u;
+                int64_t delta=int64_t(shadow+i*4)-int64_t(reinterpret_cast<uintptr_t>(&landings[i*2+1]));
+                landings[i*2+1]=0x14000000u|(uint32_t(delta/4)&0x03ffffffu);
+            }
+            if (host_returns) {
+                auto* returns=reinterpret_cast<uint32_t*>(shadow+5*page_size);
+                for(size_t i=0;i<page_size/4;++i) {
+                    returns[i*4]=0x5800005eu; // ldr LR,literal +8
+                    int64_t delta=int64_t(shadow+i*4)-int64_t(reinterpret_cast<uintptr_t>(&returns[i*4+1]));
+                    returns[i*4+1]=0x14000000u|(uint32_t(delta/4)&0x03ffffffu);
+                    uintptr_t original=page+i*4;
+                    returns[i*4+2]=uint32_t(original);returns[i*4+3]=uint32_t(original>>32);
+                }
+            }
+            sys_icache_invalidate(reinterpret_cast<void*>(shadow),stride);
+            if (mprotect(reinterpret_cast<void*>(shadow),stride,PROT_READ|PROT_EXEC)!=0 ||
+                !__macapk_try_set_syscall_guard_page(page,page+page_size,shadow,0))
+                throw std::runtime_error("linked shadow publication failed");
+            __macapk_set_shadow_landing(page,shadow+3*page_size,host_returns ? shadow+5*page_size : 0);
+            if (g_pending_guard_strip_n >= int(std::size(g_pending_guard_strip_lo)))
+                throw std::runtime_error("linked shadow protection registry full");
+            g_pending_guard_strip_lo[g_pending_guard_strip_n]=page;
+            g_pending_guard_strip_sz[g_pending_guard_strip_n++]=page_size;
+            count+=pages[page].size();
+        }
+        svc_shadow_reserve_used_=pages.size()*stride;
+        std::fprintf(stderr,"[linked-shadow] %s: %zu/%zu executable pages, %zu TLS/syscall sites\n",dbg_name_,targets.size(),pages.size(),count);
+        return count;
     }
     size_t count = 0;
     for (auto& [page, sites] : pages) {
@@ -11616,7 +11950,8 @@ size_t Image::apply_svc_shadow_pages() {
         bool reserved = false;
         if (svc_shadow_reserve_size_ - svc_shadow_reserve_used_ >= allocation_size) {
             uintptr_t candidate = svc_shadow_reserve_ + svc_shadow_reserve_used_;
-            if (macapk::a64::relocate_shadow_page(original, page, candidate, relocated)) {
+            if (macapk::a64::relocate_shadow_page(original, page, candidate, relocated, nullptr, nullptr, all_svc, std::getenv("MACAPK_SHADOW_ORIGINAL_LR")) &&
+                relocated.size() * 4 <= allocation_size) {
                 shadow = candidate;
                 reserved = true;
             }
@@ -11624,10 +11959,10 @@ size_t Image::apply_svc_shadow_pages() {
         // VM_FLAGS_FIXED fails on occupied pages; it does not replace mappings.
         // mmap's address is only a hint and commonly lands far outside ADR/LDR
         // range when an image has JVM mappings on both sides.
-        for (int64_t delta = page_size; delta <= 0xc0000 && !shadow; delta += page_size) {
+        for (int64_t delta = page_size; delta <= 0x100000 && !shadow; delta += page_size) {
             for (int sign : {1, -1}) {
                 mach_vm_address_t candidate = page + sign * delta;
-                if (!macapk::a64::relocate_shadow_page(original, page, candidate, relocated) ||
+                if (!macapk::a64::relocate_shadow_page(original, page, candidate, relocated, nullptr, nullptr, all_svc, std::getenv("MACAPK_SHADOW_ORIGINAL_LR")) ||
                     relocated.size() * 4 > allocation_size) continue;
                 if (mach_vm_allocate(mach_task_self(), &candidate, allocation_size, VM_FLAGS_FIXED) == KERN_SUCCESS) {
                     shadow = candidate;
@@ -11638,6 +11973,17 @@ size_t Image::apply_svc_shadow_pages() {
         if (!shadow) {
             std::fprintf(stderr, "[svc-shadow] %s: no free relocatable shadow for page +%#llx\n",
                          dbg_name_, (unsigned long long)(page - reinterpret_cast<uintptr_t>(base_)));
+            continue;
+        }
+        bool tls_fits = true;
+        for (uint32_t* site : sites) {
+            size_t offset = (reinterpret_cast<uintptr_t>(site) - page) / 4;
+            if ((*site & 0xffffffe0u) == 0xd53bd040u)
+                tls_fits = macapk_shadow_tls(relocated, offset, shadow, *site & 31u) && tls_fits;
+            else relocated[offset] = brk;
+        }
+        if (!tls_fits) {
+            if (!reserved) mach_vm_deallocate(mach_task_self(), shadow, allocation_size);
             continue;
         }
         if (size_t n = macapk::a64::omit_unsupported_vfork_pid_cache(relocated))
@@ -11651,7 +11997,7 @@ size_t Image::apply_svc_shadow_pages() {
             continue;
         }
         if (reserved) svc_shadow_reserve_used_ += allocation_size;
-        for (uint32_t* site : sites) *site = svc;
+        for (uint32_t* site : sites) if (*site == brk) *site = svc;
         sys_icache_invalidate(reinterpret_cast<void*>(page), page_size);
         g_pending_guard_strip_lo[g_pending_guard_strip_n] = page;
         g_pending_guard_strip_sz[g_pending_guard_strip_n++] = page_size;

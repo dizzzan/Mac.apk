@@ -1699,15 +1699,18 @@ struct ScopedBufferBytes {
         void* dptr = env->GetDirectBufferAddress(buf);
         if (dptr) {
             jint p  = env->CallIntMethod(buf, gBufCache.mPosition);
+            if (env->ExceptionCheck()) return;
             int  es = InferElemSizeCached(env, buf);
             ptr     = static_cast<char*>(dptr) + (jlong) p * es;
             return;
         }
         // 2) Heap buffer slow path -- pin the underlying array.
-        if (!env->CallBooleanMethod(buf, gBufCache.mHasArray)) return;
+        jboolean has_array = env->CallBooleanMethod(buf, gBufCache.mHasArray);
+        if (env->ExceptionCheck() || !has_array) return;
         jobject arr = env->CallObjectMethod(buf, gBufCache.mArray);
+        if (env->ExceptionCheck() || !arr) return;
         jint    pos = env->CallIntMethod(buf, gBufCache.mPosition);
-        if (!arr) return;
+        if (env->ExceptionCheck()) { env->DeleteLocalRef(arr); return; }
         elem_size = InferElemSizeCached(env, buf);
         if (elem_size == 4) {
             jfloatArray fa = static_cast<jfloatArray>(arr);
@@ -3349,6 +3352,45 @@ extern "C" void* __macapk_egl14_window_resolve(void* dpy, void* surf) {
 }
 extern "C" int __macapk_egl14_window_swap(void* dpy, void* surf) {
     return egl14_native_swap(dpy, surf);
+}
+// NDK-created SurfaceTexture windows share EGL14's producer and resize registry.
+extern "C" void* __macapk_egl14_window_create(JNIEnv* env, void* dpy, void* config,
+                                              jobject surface, const int32_t* attribs) {
+    if (env->ExceptionCheck()) return nullptr;
+    if (env->PushLocalFrame(8) != JNI_OK) {
+        env->ExceptionClear(); t_egl14PendingError = 0x3003; // EGL_BAD_ALLOC
+        return nullptr;
+    }
+    jintArray list = nullptr;
+    if (attribs) {
+        size_t n = 0;
+        while (n < 512 && attribs[n] != 0x3038) n += 2; // EGL_NONE
+        if (n == 512) { env->PopLocalFrame(nullptr); t_egl14PendingError = 0x3004; return nullptr; }
+        list = env->NewIntArray(static_cast<jsize>(n + 1));
+        if (list) env->SetIntArrayRegion(list, 0, static_cast<jsize>(n + 1), attribs);
+    }
+    jobject result = env->ExceptionCheck() ? nullptr : EGL14_eglCreateWindowSurface(env, nullptr,
+        boxDisplay(env, dpy), boxConfig(env, config), surface, list, 0);
+    int pending_error = t_egl14PendingError;
+    void* handle = result && !env->ExceptionCheck() ? egl_h(env, result) : nullptr;
+    if (!handle && pending_error) t_egl14PendingError = pending_error;
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe(); env->ExceptionClear(); t_egl14PendingError = 0x300B;
+    }
+    env->PopLocalFrame(nullptr);
+    return handle;
+}
+extern "C" int __macapk_egl14_window_destroy(JNIEnv* env, void* dpy, void* surf) {
+    Egl14Win w;
+    if (!egl14_win_take(dpy, surf, &w)) return -1;
+    jboolean result = JNI_FALSE;
+    if (!egl14_win_destroy(env, w, &result)) {
+        env->ExceptionDescribe(); env->ExceptionClear(); return 0;
+    }
+    return result ? 1 : 0;
+}
+extern "C" unsigned __macapk_egl14_window_error() {
+    return static_cast<unsigned>(EGL14_eglGetError(nullptr, nullptr));
 }
 
 namespace {
