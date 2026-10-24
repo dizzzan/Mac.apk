@@ -2422,6 +2422,20 @@ Java_com_macapk_loader_NativeAudio_nativeMpRelease(JNIEnv*, jclass, jlong h) { m
 extern "C" JNIEXPORT jint JNICALL
 Java_com_macapk_loader_NativeAudio_nativeGetBufferCapacity(JNIEnv*, jclass, jlong h) { return macapk_audio_stream_buffer_capacity((int64_t)h); }
 extern "C" JNIEXPORT jint JNICALL
+Java_com_macapk_loader_NativeAudio_nativeGetLatency(JNIEnv* env, jclass, jlong h) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    Stream* s = h > 0 && (uint64_t)h <= g_streams.size() ? g_streams[(size_t)h - 1] : nullptr;
+    if (!s || s->released.load(std::memory_order_relaxed)) {
+        jclass error = env->FindClass("java/lang/IllegalStateException");
+        if (error) env->ThrowNew(error, "AudioTrack is not initialized");
+        return -1;
+    }
+    // AOSP AudioTrack::createTrack_l: mAfLatency + 1000 * mFrameCount /
+    // mSampleRate. Our HAL is the CoreAudio output cycle and safety offset;
+    // use the same real-device query that determines the minimum buffer.
+    return (jint)(host_hal_locked().latency_ms + 1000ull * s->frame_count / s->sample_rate);
+}
+extern "C" JNIEXPORT jint JNICALL
 Java_com_macapk_loader_NativeAudio_nativeGetUnderrunCount(JNIEnv*, jclass, jlong h) { return macapk_audio_stream_underruns((int64_t)h); }
 extern "C" JNIEXPORT jint JNICALL
 Java_com_macapk_loader_NativeAudio_nativeSetBufferSize(JNIEnv*, jclass, jlong h, jint frames) { return macapk_audio_stream_set_buffer_size((int64_t)h, frames); }
@@ -2468,6 +2482,7 @@ static const JNINativeMethod kNativeAudioMethods[] = {
     {(char*)"nativeMpIsPlaying",  (char*)"(J)Z",     (void*)Java_com_macapk_loader_NativeAudio_nativeMpIsPlaying},
     {(char*)"nativeMpRelease",    (char*)"(J)V",     (void*)Java_com_macapk_loader_NativeAudio_nativeMpRelease},
     {(char*)"nativeGetBufferCapacity", (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeAudio_nativeGetBufferCapacity},
+    {(char*)"nativeGetLatency", (char*)"(J)I", (void*)Java_com_macapk_loader_NativeAudio_nativeGetLatency},
     {(char*)"nativeSetBufferSize",     (char*)"(JI)I", (void*)Java_com_macapk_loader_NativeAudio_nativeSetBufferSize},
     {(char*)"nativeGetUnderrunCount",  (char*)"(J)I",  (void*)Java_com_macapk_loader_NativeAudio_nativeGetUnderrunCount},
 };

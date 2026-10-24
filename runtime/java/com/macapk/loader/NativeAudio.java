@@ -118,6 +118,7 @@ public final class NativeAudio {
     // getBufferCapacityInFrames / setBufferSizeInFrames (audio_backend.mm
     // macapk_audio_stream_buffer_capacity / _set_buffer_size).
     public static native int nativeGetBufferCapacity(long h);
+    public static native int nativeGetLatency(long h);
     public static native int nativeSetBufferSize(long h, int frames);
     // AudioTrack.getUnderrunCount: starved render cycles, one per episode.
     public static native int nativeGetUnderrunCount(long h);

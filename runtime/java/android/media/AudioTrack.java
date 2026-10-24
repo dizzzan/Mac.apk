@@ -228,6 +228,13 @@ public class AudioTrack implements AudioRouting, VolumeAutomation {
     // back, so the last adopted value is always the current value.
     public int getBufferSizeInFrames() { return effectiveBufferInFrames; }
 
+    /** AOSP's hidden getLatency: estimated output pipeline plus the track's
+     * buffer duration, in milliseconds (not the instantaneous queued audio). */
+    public int getLatency() {
+        if (handle == 0) throw new IllegalStateException("AudioTrack is not initialized");
+        return com.macapk.loader.NativeAudio.nativeGetLatency(handle);
+    }
+
     /**
      * The maximum size of the track's buffer in frames. API 24. AOSP:
      * `return native_get_buffer_capacity_frames();`
