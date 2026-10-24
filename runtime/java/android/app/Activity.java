@@ -1302,6 +1302,8 @@ public class Activity extends ContextThemeWrapper
      *  framework's auto-content path, but it's non-null so AppCompat's
      *  id-aliasing pass runs and subDecor ends up with a 16908290 child. */
     private static final class ActivityWindow extends Window {
+        private static final boolean PRESERVE_DECOR =
+                "1".equals(System.getenv("MACAPK_WINDOW_PRESERVE_DECOR"));
         private final Activity activity;
         private android.view.View decor;
         private android.view.View content;
@@ -2078,6 +2080,10 @@ public class Activity extends ContextThemeWrapper
         }
         @Override public void setContentView(android.view.View view) {
             ensureDecor();
+            if (PRESERVE_DECOR) {
+                setContentView(view, new android.view.ViewGroup.LayoutParams(-1, -1));
+                return;
+            }
             // A screen_title window keeps its decor: AOSP PhoneWindow
             // .setContentView(View) puts the view INTO the content frame
             // (:486-506). Activity.macapkInstallContentDirect does exactly that
@@ -2101,11 +2107,24 @@ public class Activity extends ContextThemeWrapper
             // installs the view without any AppCompat round-trip.
             activity.macapkInstallContentDirect(view);
         }
-        @Override public void setContentView(android.view.View view, android.view.ViewGroup.LayoutParams params) { setContentView(view); }
+        @Override public void setContentView(android.view.View view, android.view.ViewGroup.LayoutParams params) {
+            if (!PRESERVE_DECOR) { setContentView(view); return; }
+            ensureDecor();
+            // PhoneWindow keeps one decor and replaces only mContentParent's
+            // children. Making an AppCompat LinearLayout the decor instead
+            // lets window-level overlay views consume the content's height.
+            android.view.ViewGroup parent = (android.view.ViewGroup) content;
+            parent.removeAllViews();
+            parent.addView(view, params);
+            activity.macapkInstallContentDirect(decor);
+            parent.requestApplyInsets();
+            if (getCallback() != null) getCallback().onContentChanged();
+        }
         @Override public void addContentView(android.view.View view, android.view.ViewGroup.LayoutParams params) {
             ensureDecor();
             if (content instanceof android.view.ViewGroup vg) {
-                vg.addView(view);
+                if (PRESERVE_DECOR) vg.addView(view, params);
+                else vg.addView(view);
             }
         }
         @Override public android.view.View findViewById(int id) {

@@ -286,7 +286,7 @@ public final class ClassFileWriter {
     private int majorVersion = DEFAULT_VERSION;
     private int minorVersion = 0;
 
-    private final int access;
+    private int access;
     private final String thisName;
     private final String superName;
     private final String[] interfaces;
@@ -564,6 +564,16 @@ public final class ClassFileWriter {
      * symptom is reflection quietly disagreeing with a javac build.
      */
     public void addInnerClass(String innerName, String outerName, String innerSimpleName, int innerAccess) {
+        // DEX InnerClass records the declared modifiers, which can differ
+        // from class_def after shrinking. ART's Class.getModifiers uses those
+        // declared flags. HotSpot does too, but its verifier uses the header:
+        // a public nested interface with a package-private header makes Proxy
+        // choose a public proxy that the VM then rejects with IllegalAccessError.
+        // Restore the declared public visibility in the emitted JVM header;
+        // private/protected/package declarations keep their existing header.
+        if (thisName.equals(innerName) && (innerAccess & ACC_PUBLIC) != 0) {
+            access |= ACC_PUBLIC;
+        }
         if (innerSimpleName == null && outerName != null) {
             // Remember it for THIS class only: JVMS 4.7.7 says the enclosing
             // class of an anonymous class travels in EnclosingMethod instead,
