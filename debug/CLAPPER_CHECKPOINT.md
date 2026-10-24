@@ -12,6 +12,9 @@ own "Device Environment Abnormality" overlay, with copyright-protection text,
 after video decoding had started. Its secure-window capture restriction remains
 intact. At the owner's request the active debug app's private and external data
 were cleared, and the owner completed setup with a test account.
+The owner subsequently confirmed the same environment warning on the test
+account, with live video visible behind it and no audible sound. Changing
+accounts did not resolve that warning.
 
 Generic media and animation fixes now cover three additional Android contracts:
 
@@ -62,6 +65,21 @@ All four new native fixtures are included in debug/shadow_checkpoint_gate.sh.
 Live video and controls were visually observed after engine initialization;
 continuous playback, sound and reconnect behavior still need verification.
 No app checks, account decisions, or secure-window behavior are modified.
+
+Profiling the live SDK then found frequent far-branch traps: linked execution
+copies of a large ELF can be more than the AArch64 B/BL range (128 MiB) apart.
+Those transfers now use literal-address veneers through the existing landing
+pads, preserving x16, LR, NZCV and the stack. Original guest return addresses
+remain observable. Destinations without a registered landing retain the trap
+fallback. The loader uses the same resolver when refreshing execution copies.
+
+`FarShadowBranchTest` executes BL, B, B.cond, CBZ, TBZ and page fallthrough with
+copies 224 MiB apart and non-executable original pages. All six paths preserve
+the original LR, scratch registers, flags and stack over 1,000 repetitions
+without a signal handler. The complete 13-fixture native gate passes. In the
+updated live run Agora reported its first rendered frames after about two
+seconds; continuous usable playback remains unverified because of the warning
+and silent audio. This is not a claim that Clapper's environment check is fixed.
 
 ## Login dialog visibility
 

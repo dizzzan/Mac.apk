@@ -17,7 +17,8 @@ inline bool relocate_shadow_page(std::span<const uint32_t> words,
                                  std::vector<uint32_t>& out,
                                  const char** failure = nullptr, uint64_t* failure_pc = nullptr,
                                  bool far_literals = false, bool original_lr = false,
-                                 const std::function<uint64_t(uint64_t)>& code_target = {}) {
+                                 const std::function<uint64_t(uint64_t)>& code_target = {},
+                                 const std::function<uint64_t(uint64_t)>& code_landing = {}) {
     out.assign(words.begin(), words.end());
     size_t current = 0;
     auto fail = [&](const char* why) {
@@ -38,12 +39,39 @@ inline bool relocate_shadow_page(std::span<const uint32_t> words,
         return true;
     };
     auto resolve = [&](uint64_t pc) { return code_target ? code_target(pc) : pc; };
+    // Linked copies can be more than B's +/-128 MiB apart. Their landings
+    // restore x16/LR from the stack, so an absolute transfer can preserve all
+    // guest registers and flags without taking a BRK and an execution fault.
+    // Only use a landing supplied by the loader; untranslated targets retain
+    // the existing trap path. A call still exposes the original guest LR.
+    auto append_far_transfer = [&](uint64_t target, uint64_t lr) -> size_t {
+        uint64_t landing = code_landing ? code_landing(target) : 0;
+        if (!landing) return 0;
+        size_t start = out.size();
+        out.push_back(0xa9bf7bf0u); // stp x16,x30,[sp,#-16]!
+        if (lr) {
+            out.push_back(0x580000d0u); // ldr x16, original LR literal at +24
+            out.push_back(0xf90007f0u); // str x16,[sp,#8]
+        }
+        out.push_back(0x58000050u); // ldr x16, landing literal at +8
+        out.push_back(0xd61f0200u); // br x16; landing restores x16/LR
+        out.push_back(uint32_t(landing));
+        out.push_back(uint32_t(landing >> 32));
+        if (lr) { out.push_back(uint32_t(lr)); out.push_back(uint32_t(lr >> 32)); }
+        return start;
+    };
     uint32_t fallthrough;
     if (!branch(shadow + words.size_bytes(), resolve(original + words.size_bytes()), fallthrough)) {
         if (!far_literals) return fail("fallthrough range");
         fallthrough = 0xd4200000u | (0x4da1u << 5); // registered-page continuation
     }
     out.push_back(fallthrough);
+    if (fallthrough == (0xd4200000u | (0x4da1u << 5))) {
+        if (size_t thunk = append_far_transfer(original + words.size_bytes(), 0)) {
+            if (!branch(shadow + words.size_bytes(), shadow + thunk * 4, out[words.size()]))
+                return fail("fallthrough thunk range");
+        }
+    }
     for (size_t i = 0; i < words.size(); ++i) {
         current = i;
         uint32_t w = words[i], changed = w;
@@ -61,6 +89,11 @@ inline bool relocate_shadow_page(std::span<const uint32_t> words,
                     target = shadow + (target - original);
                 else target = resolve(target);
                 if (!branch(thunk + 4, target, transfer)) {
+                    uint64_t original_target = oa + sx(w & 0x03ffffffu, 26) * 4;
+                    if (size_t index = append_far_transfer(original_target, oa + 4)) {
+                        if (!branch(sa, shadow + index * 4, out[i])) return fail("far call thunk range");
+                        continue;
+                    }
                     out[i] = 0xd4200000u | (0x4da0u << 5); // original B/BL destination and LR
                     continue;
                 }
@@ -102,6 +135,12 @@ inline bool relocate_shadow_page(std::span<const uint32_t> words,
             uint32_t b;
             if (!branch(sa, target, b)) {
                 if (!far_literals) return fail("B/BL range");
+                uint64_t original_target = oa + sx(w & 0x03ffffffu, 26) * 4;
+                uint64_t lr = (w & 0x80000000u) ? (original_lr ? oa + 4 : sa + 4) : 0;
+                if (size_t index = append_far_transfer(original_target, lr)) {
+                    if (!branch(sa, shadow + index * 4, out[i])) return fail("far branch thunk range");
+                    continue;
+                }
                 out[i] = 0xd4200000u | (0x4da0u << 5);
                 continue;
             }
@@ -144,16 +183,20 @@ inline bool relocate_shadow_page(std::span<const uint32_t> words,
                     uint64_t veneer = shadow + out.size() * 4;
                     uint32_t b;
                     bool far_transfer = !branch(veneer, target, b);
+                    bool linked_transfer = false;
                     if (far_transfer) {
                         if (!far_literals) return fail("veneer destination range");
                         b = 0xd4200000u | (0x4da2u << 5);
+                        linked_transfer = append_far_transfer(oa + sx((w >> 5) & mask, bits) * 4, 0) != 0;
                     }
                     delta = int64_t(veneer - sa);
                     if ((delta & 3) || !fits(delta / 4, bits)) return fail("veneer branch range");
-                    out.push_back(b);
-                    if (far_transfer) {
-                        out.push_back(uint32_t(target));
-                        out.push_back(uint32_t(target >> 32));
+                    if (!linked_transfer) {
+                        out.push_back(b);
+                        if (far_transfer) {
+                            out.push_back(uint32_t(target));
+                            out.push_back(uint32_t(target >> 32));
+                        }
                     }
                 }
                 changed = (w & ~(mask << 5)) | ((uint32_t(delta / 4) & mask) << 5);

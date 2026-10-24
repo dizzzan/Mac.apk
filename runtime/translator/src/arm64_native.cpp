@@ -11815,8 +11815,10 @@ extern "C" bool __macapk_refresh_execution_shadow(uintptr_t original, uintptr_t 
     std::vector<uint32_t> code;
     bool linked = __macapk_shadow_landing_for(original) != 0;
     std::function<uint64_t(uint64_t)> resolve;
+    std::function<uint64_t(uint64_t)> landing;
     if (linked) resolve = [](uint64_t pc) { return __macapk_shadow_code_for(pc); };
-    if (!macapk::a64::relocate_shadow_page(source, original, shadow, code, nullptr, nullptr, true, std::getenv("MACAPK_SHADOW_ORIGINAL_LR"), resolve) ||
+    if (linked) landing = [](uint64_t pc) { return __macapk_shadow_landing_for(pc); };
+    if (!macapk::a64::relocate_shadow_page(source, original, shadow, code, nullptr, nullptr, true, std::getenv("MACAPK_SHADOW_ORIGINAL_LR"), resolve, landing) ||
         code.size() * 4 > allocation) return false;
     for (size_t i = 0; i < source.size(); ++i) {
         if (source[i] == 0xd4000001u) code[i] = 0xd4200000u | (0x4d41u << 5);
@@ -11886,6 +11888,10 @@ size_t Image::apply_svc_shadow_pages() {
             auto i=targets.find(pc & ~(uint64_t(page_size)-1));
             return i == targets.end() ? pc : i->second + (pc & (page_size-1));
         };
+        auto landing = [&](uint64_t pc) -> uint64_t {
+            auto i=targets.find(pc & ~(uint64_t(page_size)-1));
+            return i == targets.end() ? 0 : i->second + 3*page_size + (pc & (page_size-1))*2;
+        };
         bool removed;
         do {
             removed = false; copies.clear();
@@ -11893,7 +11899,7 @@ size_t Image::apply_svc_shadow_pages() {
                 uintptr_t page=it->first, shadow=it->second;
                 std::span<const uint32_t> words(reinterpret_cast<const uint32_t*>(page),page_size/4);
                 auto& code=copies[page];
-                bool ok=macapk::a64::relocate_shadow_page(words,page,shadow,code,nullptr,nullptr,true,true,resolve);
+                bool ok=macapk::a64::relocate_shadow_page(words,page,shadow,code,nullptr,nullptr,true,true,resolve,landing);
                 if (ok) for (uint32_t* site : pages[page]) {
                     size_t offset=(reinterpret_cast<uintptr_t>(site)-page)/4;
                     if ((*site & 0xffffffe0u)==0xd53bd040u) ok=macapk_shadow_tls(code,offset,shadow,*site & 31u) && ok;
