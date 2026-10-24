@@ -42732,6 +42732,14 @@ static std::string macapk_arm64_remap_path_unguarded(const char* p) {
     // resolves to a real file there. Falling back to apkt/assets/ keeps
     // dev-tree behavior intact when no android_root is configured.
     if (root) {
+        // These are real parent directories in the installed Android tree.
+        // Match them before the package-prefix rules: a trailing slash on
+        // /data/data/ must not turn the parent into the current app's folder,
+        // and removing that slash must not make the same directory disappear.
+        for (const char* parent : {"/data", "/data/data", "/data/app"}) {
+            if (s == parent || s == std::string(parent) + "/")
+                return std::string(root) + s;
+        }
         // Resolve the per-version data subdir name. Set by Boot.java
         // as "<package>_<versionName>" so two versions of the same
         // package don't share state. Falls back to bare package name
