@@ -664,6 +664,8 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     }
     /** @hide AOSP (:120). */
     public static final int UNDEFINED_ITEM_ID = Integer.MAX_VALUE;
+    public static final int ROOT_ITEM_ID = Integer.MAX_VALUE - 1;
+    public static final long ROOT_NODE_ID = makeNodeId(ROOT_ITEM_ID, AccessibilityNodeProvider.HOST_VIEW_ID);
     private static final long VIRTUAL_DESCENDANT_ID_MASK = 0xffffffff00000000L;
     private static final int VIRTUAL_DESCENDANT_ID_SHIFT = 32;
     /** @hide AOSP (:856-858). */
@@ -679,11 +681,8 @@ public class AccessibilityNodeInfo implements android.os.Parcelable {
     public static long makeNodeId(int accessibilityViewId, int virtualDescendantId) {
         return (((long) virtualDescendantId) << VIRTUAL_DESCENDANT_ID_SHIFT) | accessibilityViewId;
     }
-    // AOSP reads View.getAccessibilityViewId(), a per-view id from a static
-    // counter; our View has no such id, so the identity hash stands in. It only
-    // has to tell a node's children apart, which it does for live views.
     private static int accessibilityViewIdOf(android.view.View v) {
-        return v == null ? UNDEFINED_ITEM_ID : System.identityHashCode(v);
+        return v == null ? UNDEFINED_ITEM_ID : v.getAccessibilityViewId();
     }
     private void addChildId(long id) {
         for (int i = 0; i < mChildIdCount; i++) if (mChildNodeIds[i] == id) return;

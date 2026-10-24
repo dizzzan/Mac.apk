@@ -1848,6 +1848,17 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  is already attached. */
     boolean macapkAttached = false;
     public boolean isAttachedToWindow()                { return macapkAttached; }
+    private static final java.util.concurrent.atomic.AtomicInteger sNextAccessibilityViewId =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private int mAccessibilityViewId = NO_ID;
+
+    /** AOSP's stable per-view accessibility ID is independent of the resource ID. */
+    public synchronized int getAccessibilityViewId() {
+        if (mAccessibilityViewId == NO_ID) {
+            mAccessibilityViewId = sNextAccessibilityViewId.getAndIncrement();
+        }
+        return mAccessibilityViewId;
+    }
     private static boolean warnedAttachThrow = false;
     private static boolean warnedSizeChanged = false;
     /** Class names whose onMeasure has already been reported as throwing.
