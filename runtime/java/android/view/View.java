@@ -1830,12 +1830,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public android.os.IBinder getApplicationWindowToken() {
         return macapkAttached ? MACAPK_WINDOW_TOKEN : null;
     }
-    /** AOSP-internal accessor. SmashHit reflectively probes
-     *  View.getViewRootImpl() (then null-checks the result). We have no
-     *  ViewRootImpl object, so we return null -- the same value real Android
-     *  returns for a view that isn't attached to a window's root. Return type
-     *  is Object since the internal ViewRootImpl type isn't modelled. */
-    public Object getViewRootImpl() { return null; }
+    /** AOSP: mAttachInfo != null ? mAttachInfo.mViewRootImpl : null.
+     *  Preserve the typed descriptor for JNI callers as well as reflection.
+     *  The runtime's single host window uses the shared traversal root. */
+    public ViewRootImpl getViewRootImpl() {
+        return macapkAttached ? ViewRootImpl.getInstance() : null;
+    }
     /** REAL attach-state tracking (was hardcoded `true`). The
      *  always-true lie made constructor-time code take attached-only
      *  branches with zero children: MotionLayout.loadLayoutDescription
