@@ -104,7 +104,10 @@ schedule the compositor. This follows the parent lifetime in
 [AOSP ViewRootImpl.setView/dispatchDetachedFromWindow](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android14-release/core/java/android/view/ViewRootImpl.java).
 The app's own completion handler now removes LoaderView (the overlay stack
 returns to zero), and the live screen visibly has no loading spinner. Touch
-events reach LiveAudienceActivity. Stream switching is still under validation.
+events reach LiveAudienceActivity. The owner confirmed that normal swiping now
+switches live streams. The automated drag sends only one MOVE, which the
+RecyclerView consumes while intercepting; it was not used as a successful
+stream-switching test.
 
 `debug/WindowOverlayParentTest.java` fails before the change and passes 20
 checks afterward: guarded cleanup, attach/detach callback ordering, subtree
