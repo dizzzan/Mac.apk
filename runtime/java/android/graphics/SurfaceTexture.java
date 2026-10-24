@@ -945,6 +945,12 @@ public class SurfaceTexture {
         macapkQueueProducerFrame(argb, width, height, strideInPixels, null, null, false);
     }
 
+    /** MediaCodec producer: the buffer's timestamp belongs to this stream. */
+    public void macapkQueueDecodedFrame(int[] argb, int width, int height,
+                                        int strideInPixels, long timestampNanos) {
+        queueProducerFrame(argb, width, height, strideInPixels, null, null, false, timestampNanos);
+    }
+
     // ---- Per-instance pixel producer (EGL window surfaces) ----------------
     //
     // WHY (2026-09-26, docs/telegram-intro-logo_2026-09-26.md §7). On Android
@@ -1014,6 +1020,13 @@ public class SurfaceTexture {
                                          int strideInPixels, float[] transform,
                                          java.util.function.Consumer<int[]> recycler,
                                          boolean premultipliedSource) {
+        queueProducerFrame(argb, width, height, strideInPixels, transform, recycler,
+                           premultipliedSource, System.nanoTime());
+    }
+    private void queueProducerFrame(int[] argb, int width, int height,
+                                    int strideInPixels, float[] transform,
+                                    java.util.function.Consumer<int[]> recycler,
+                                    boolean premultipliedSource, long timestampNanos) {
         Handler h;
         int[] superseded = null;
         java.util.function.Consumer<int[]> supersededRecycler = null;
@@ -1040,22 +1053,7 @@ public class SurfaceTexture {
             mVideoFrameGlPremul = premultipliedSource;
             mHasVideoFrame = true;
             mFrameAvailable = true;
-            // KNOWN LIMITATION, honestly stamped rather than left stale or
-            // invented as a decode PTS: MediaCodec.releaseOutputBuffer(index,
-            // true) -> NativeMedia.nativeVidRender(pixbufHandle, width,
-            // height) carries no presentationTimeUs at all (see that
-            // method's own signature/doc), so the frame's real decode PTS
-            // never crosses into this class. Wall-clock-at-arrival is a
-            // monotonically increasing, honest stand-in that satisfies
-            // getTimestamp()'s documented contract ("normally... measured
-            // with the same clock as... elapsedRealtimeNanos", i.e.
-            // monotonic, not tied to a specific stream's PTS) without
-            // freezing at a stale value the way leaving mPendingTimestamp
-            // untouched would. A real fix threads BufferInfo.presentationTimeUs
-            // through nativeVidRender and NativeMedia.nativeVidRender -- a
-            // MediaCodec.java/NativeMedia.java change outside this class's
-            // owned files; see the deliverable report.
-            mPendingTimestamp = System.nanoTime();
+            mPendingTimestamp = timestampNanos;
             h = mOnFrameAvailableHandler;
         }
         if (supersededRecycler != null) supersededRecycler.accept(superseded);

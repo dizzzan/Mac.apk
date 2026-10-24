@@ -529,7 +529,10 @@ public final class MediaCodec {
     private void vidDecode(byte[] au, long presentationTimeUs, boolean eos) {
         if (isVp8()) com.macapk.loader.NativeMedia.nativeVp8Decode(mVidDec, au, presentationTimeUs, eos);
         else if (isVp9()) com.macapk.loader.NativeMedia.nativeVp9Decode(mVidDec, au, presentationTimeUs, eos);
-        else com.macapk.loader.NativeMedia.nativeVidDecode(mVidDec, au, presentationTimeUs, eos);
+        else {
+            int rc = com.macapk.loader.NativeMedia.nativeVidDecode(mVidDec, au, presentationTimeUs, eos);
+            if (rc < 0) throw new CodecException(rc, "VideoToolbox: decode/configuration failed (" + rc + ")");
+        }
     }
     // AOSP: registering a callback before start() (or after flush(), which
     // must be followed by start() again in async mode -- see flush() below)
@@ -1155,23 +1158,17 @@ public final class MediaCodec {
             boolean codecConfig = (flags & BUFFER_FLAG_CODEC_CONFIG) != 0;
             if (size > 0 && !codecConfig) com.macapk.loader.MediaStats.codecIn(mStat);
             byte[] au = null;
-            if (size > 0 && !codecConfig && mIn != null && index >= 0 && index < mIn.length) {
+            if (size > 0 && (!codecConfig || mIsVideo) && mIn != null && index >= 0 && index < mIn.length) {
                 ByteBuffer b = mIn[index].duplicate(); b.position(offset); b.limit(offset + size);
                 au = new byte[size]; b.get(au);
             }
             if (mVidDec != 0) {
-                // AOSP: codec-specific data "is automatically submitted to
-                // the codec upon start(); you MUST NOT submit this data
-                // explicitly" -- our video open() already built the format
-                // description from the configure()-time csd-0/csd-1, so a
-                // codec-config-flagged buffer here is a legitimate no-op for
-                // the payload (matching the audio branch below), though an
-                // EOS flag riding along with one must still be honored.
-                if (!codecConfig) {
+                // AOSP permits codec-specific data after start() when it was
+                // absent from the MediaFormat. AVC/HEVC header-only input is
+                // consumed by the native backend without producing a frame.
+                if (!codecConfig || "video/avc".equals(mVidMime) || "video/hevc".equals(mVidMime))
                     vidDecode(au, presentationTimeUs, eos);
-                } else if (eos) {
-                    vidDecode(null, presentationTimeUs, true);
-                }
+                else if (eos) vidDecode(null, presentationTimeUs, true);
             } else if (mDec != 0 && !codecConfig) {
                 byte[] pcm = com.macapk.loader.NativeMedia.nativeDecDecode(mDec, au, eos);
                 if (pcm != null && (pcm.length > 0 || eos))
@@ -1251,6 +1248,14 @@ public final class MediaCodec {
         info.set(0, e.pcm.length, e.pts, e.flags);
         return oi;
     }
+    private void renderVideoFrame(long pixbuf, long timestampNanos) {
+        android.view.Surface surface = mSurface;
+        if (surface == null || !surface.isValid()) return;
+        android.graphics.SurfaceTexture texture = surface.macapkGetSurfaceTexture();
+        if (texture != null)
+            com.macapk.loader.NativeMedia.nativeVidRenderToTexture(pixbuf, texture, timestampNanos);
+        else com.macapk.loader.NativeMedia.nativeVidRender(pixbuf, mVidWidth, mVidHeight);
+    }
     public void releaseOutputBuffer(int index, boolean render) {
         synchronized (mAsyncLock) {
             if (mIsVideo && mOutPixbuf != null && index >= 0 && index < mOutPixbuf.length) {
@@ -1265,7 +1270,7 @@ public final class MediaCodec {
                     if (PRESENT_TRACE && !render) mTraceAppDrops++;
                     if (render && mHasSurface) {
                         if (PRESENT_TRACE) tracePresent();
-                        com.macapk.loader.NativeMedia.nativeVidRender(pb, mVidWidth, mVidHeight);
+                        renderVideoFrame(pb, mOutPts[index] * 1000L);
                         com.macapk.loader.MediaStats.codecRendered(mStat);
                     }
                     com.macapk.loader.NativeMedia.nativeVidReleaseFrame(pb);
@@ -1306,7 +1311,7 @@ public final class MediaCodec {
         long due = renderTimestampNs;
         if (due < now || due - now > 1_000_000_000L) due = now;   // late, or "not within a second": now
         synchronized (mTimedLock) {
-            mTimed.addLast(new long[]{ pb, due });
+            mTimed.addLast(new long[]{ pb, due, renderTimestampNs });
             if (mTimedThread == null) {
                 mTimedQuit = false;
                 mTimedThread = new Thread(this::timedPresentLoop, "MediaCodec:VideoPresent");
@@ -1405,7 +1410,7 @@ public final class MediaCodec {
                 // release) waits for an in-flight present instead of freeing
                 // the buffer underneath it.
                 try {
-                    com.macapk.loader.NativeMedia.nativeVidRender(show[0], mVidWidth, mVidHeight);
+                    renderVideoFrame(show[0], show[2]);
                     com.macapk.loader.MediaStats.codecRendered(mStat);
                 } catch (Throwable ignored) {}
                 com.macapk.loader.NativeMedia.nativeVidReleaseFrame(show[0]);

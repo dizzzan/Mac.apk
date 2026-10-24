@@ -76,7 +76,7 @@ public final class NativeMedia {
      *  no out-of-band parameter sets). wantSurface is a hint only (today's
      *  destination format is BGRA either way). Returns an opaque native
      *  handle, or 0 on failure (unsupported mime, or csd that did not yield
-     *  usable parameter sets). */
+     *  usable parameter sets). AVC/HEVC with no csd waits for input headers. */
     public static native long nativeVidOpen(String mime, int width, int height,
                                             byte[] csd0, byte[] csd1, boolean wantSurface);
     /** Feeds one compressed access unit (Annex-B for avc/hevc -- converted to
@@ -98,6 +98,9 @@ public final class NativeMedia {
      *  polled frame onto the app's video layer. Does not itself free the
      *  frame -- call nativeVidReleaseFrame afterward regardless. */
     public static native void nativeVidRender(long pixbufHandle, int width, int height);
+    /** Queue into the codec's own texture, preserving its frame timestamp. */
+    public static native void nativeVidRenderToTexture(long pixbufHandle,
+        android.graphics.SurfaceTexture texture, long timestampNanos);
     /** Frees a polled frame's native memory. Required exactly once per
      *  nativeVidPoll result, whether or not it was rendered. */
     public static native void nativeVidReleaseFrame(long pixbufHandle);

@@ -316,16 +316,19 @@ bool BuildFormatDescriptionH264(const uint8_t* csd0, int csd0Len,
                                 CMVideoFormatDescriptionRef* outDesc) {
     auto spsNals = SplitAnnexB(csd0, csd0Len > 0 ? (size_t)csd0Len : 0);
     auto ppsNals = SplitAnnexB(csd1, csd1Len > 0 ? (size_t)csd1Len : 0);
+    spsNals.insert(spsNals.end(), ppsNals.begin(), ppsNals.end());
     std::vector<const uint8_t*> ptrs;
     std::vector<size_t> sizes;
+    bool haveSps = false, havePps = false;
     for (const auto& n : spsNals) {
         int t = H264NalType(n);
         if (t == 7 || t == 13) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
+        haveSps |= t == 7;
     }
-    for (const auto& n : ppsNals) {
-        if (H264NalType(n) == 8) { ptrs.push_back(n.ptr); sizes.push_back(n.len); }
+    for (const auto& n : spsNals) {
+        if (H264NalType(n) == 8) { ptrs.push_back(n.ptr); sizes.push_back(n.len); havePps = true; }
     }
-    if (ptrs.size() < 2) {
+    if (!haveSps || !havePps) {
         std::fprintf(stderr,
             "[video-toolbox] H264: csd-0/csd-1 did not yield SPS+PPS (found %zu "
             "usable parameter-set NALs; csd0Len=%d csd1Len=%d)\n",
@@ -563,6 +566,10 @@ struct VtDecoder {
     int  width = 0, height = 0;
     bool isAvcOrHevc = false;     // gates the AnnexBToAvcc rewrite on feed
     bool usingHardware = false;
+    // Android permits AVC/HEVC configuration in input buffers after start().
+    // Keep only parameter NALs while waiting; never retain whole live frames.
+    std::vector<uint8_t> pendingCsd;
+
 
     // VTDecompressionSessionDecodeFrame is called with EnableAsynchronous
     // Decompression | EnableTemporalProcessing (see CreateSessionInternal) so
@@ -829,6 +836,16 @@ void* macapk_vtb_open(const char* mimeC, int width, int height,
     }
     bool isAvcHevc = (fourcc == kCMVideoCodecType_H264 || fourcc == kCMVideoCodecType_HEVC);
 
+    if (isAvcHevc && csd0Len <= 0 && csd1Len <= 0) {
+        auto* d = new VtDecoder();
+        d->codecType = fourcc;
+        d->isAvcOrHevc = true;
+        d->width = width; d->height = height;
+        if (outHw) *outHw = 0; // no session exists until the headers arrive
+        std::fprintf(stderr, "[video-toolbox] open: mime=%s waiting for in-band parameter sets\n", mime.c_str());
+        return d;
+    }
+
     CMVideoFormatDescriptionRef fmt = nullptr;
     bool ok;
     if (fourcc == kCMVideoCodecType_H264) {
@@ -866,13 +883,72 @@ void* macapk_vtb_open(const char* mimeC, int width, int height,
     return d;
 }
 
+// Parameter sets may arrive separately (BUFFER_FLAG_CODEC_CONFIG) or together
+// with the first key frame. A header-only buffer must not produce a picture.
+static bool HasVideoSlices(const std::vector<NalRef>& nals, CMVideoCodecType codec) {
+    for (const auto& n : nals) {
+        int type = codec == kCMVideoCodecType_H264 ? H264NalType(n) : HevcNalType(n);
+        if (codec == kCMVideoCodecType_H264 ? (type >= 1 && type <= 5) : (type >= 0 && type <= 31)) return true;
+    }
+    return false;
+}
+static int OpenDeferredSession(VtDecoder* d, const std::vector<NalRef>& nals) {
+    for (const auto& n : nals) {
+        int type = d->codecType == kCMVideoCodecType_H264 ? H264NalType(n) : HevcNalType(n);
+        bool parameter = d->codecType == kCMVideoCodecType_H264
+            ? (type == 7 || type == 8 || type == 13) : (type >= 32 && type <= 34);
+        if (!parameter) continue;
+        bool duplicate = false;
+        for (const auto& old : SplitAnnexB(d->pendingCsd.data(), d->pendingCsd.size()))
+            if (old.len == n.len && !std::memcmp(old.ptr, n.ptr, n.len)) { duplicate = true; break; }
+        if (duplicate) continue;
+        if (d->pendingCsd.size() + n.len + 4 > 1024 * 1024) return -6;
+        d->pendingCsd.insert(d->pendingCsd.end(), {0, 0, 0, 1});
+        d->pendingCsd.insert(d->pendingCsd.end(), n.ptr, n.ptr + n.len);
+    }
+    bool sps = false, pps = false, vps = false;
+    for (const auto& n : SplitAnnexB(d->pendingCsd.data(), d->pendingCsd.size())) {
+        int type = d->codecType == kCMVideoCodecType_H264 ? H264NalType(n) : HevcNalType(n);
+        if (d->codecType == kCMVideoCodecType_H264) { sps |= type == 7; pps |= type == 8; }
+        else { vps |= type == 32; sps |= type == 33; pps |= type == 34; }
+    }
+    if (!sps || !pps || (d->codecType == kCMVideoCodecType_HEVC && !vps)) return 0;
+    CMVideoFormatDescriptionRef fmt = nullptr;
+    bool ok = d->codecType == kCMVideoCodecType_H264
+        ? BuildFormatDescriptionH264(d->pendingCsd.data(), (int)d->pendingCsd.size(), nullptr, 0, &fmt)
+        : BuildFormatDescriptionHEVC(d->pendingCsd.data(), (int)d->pendingCsd.size(), &fmt);
+    if (!ok || !fmt) return -6;
+    d->session = CreateSessionInternal(fmt, d, &d->usingHardware);
+    if (!d->session) { CFRelease(fmt); return -6; }
+    d->fmtDesc = fmt;
+    auto dim = CMVideoFormatDescriptionGetDimensions(fmt);
+    d->width = dim.width; d->height = dim.height;
+    d->pendingCsd.clear();
+    std::fprintf(stderr, "[video-toolbox] in-band session ready: %dx%d hw=%s\n",
+                 d->width, d->height, d->usingHardware ? "YES" : "no (software)");
+    return 1;
+}
+
 // Feeds one compressed access unit (may be null/0-length at eos with nothing
 // left to submit). Fire-and-forget: the decoded frame (if any) surfaces later
 // through macapk_vtb_poll. Returns 0 on success, negative on error.
 int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int eos) {
     VtDecoder* d = (VtDecoder*)h;
-    if (!d || !d->session) return -1;
-    if (au && auLen > 0) {
+    if (!d) return -1;
+    bool hasPicture = au && auLen > 0;
+    if (hasPicture && d->isAvcOrHevc) {
+        auto nals = SplitAnnexB(au, (size_t)auLen);
+        if (nals.empty() && !d->session) return -6;
+        // Preserve the existing length-prefixed path for an already-open
+        // decoder. Deferred configuration requires Android's Annex-B form.
+        hasPicture = nals.empty() ? d->session != nullptr : HasVideoSlices(nals, d->codecType);
+        if (!d->session) {
+            int opened = OpenDeferredSession(d, nals);
+            if (opened < 0) return opened;
+            if (!d->session && hasPicture) return -6; // frame before its required headers
+        }
+    }
+    if (hasPicture && d->session) {
         std::vector<uint8_t> payload = d->isAvcOrHevc
             ? AnnexBToAvcc(au, (size_t)auLen)
             : std::vector<uint8_t>(au, au + auLen);
@@ -919,8 +995,10 @@ int macapk_vtb_decode(void* h, const uint8_t* au, int auLen, int64_t ptsUs, int 
         // Block (briefly -- a one-time end-of-stream event, not a hot path)
         // until every in-flight/delayed frame has been through the callback,
         // so the EOS marker we push below is genuinely last in the queue.
-        VTDecompressionSessionFinishDelayedFrames(d->session);
-        VTDecompressionSessionWaitForAsynchronousFrames(d->session);
+        if (d->session) {
+            VTDecompressionSessionFinishDelayedFrames(d->session);
+            VTDecompressionSessionWaitForAsynchronousFrames(d->session);
+        }
         std::lock_guard<std::mutex> lk(d->mu);
         d->outQ.push_back({nullptr, -1, kFlagEndOfStream});
     }
@@ -1226,6 +1304,41 @@ void Java_com_macapk_loader_NativeMedia_nativeVidRender(JNIEnv*, jclass, jlong p
     macapk_vtb_render_frame((void*)(uintptr_t)pixbuf, width, height);
 }
 
+// A codec owns a specific BufferQueue. Routing through the window's most
+// recently created SurfaceTexture loses frames when a live player has both
+// a decoder texture and a separate GL-renderer texture.
+void Java_com_macapk_loader_NativeMedia_nativeVidRenderToTexture(JNIEnv* env, jclass,
+        jlong pixbuf, jobject texture, jlong timestampNs) {
+    if (!pixbuf || !texture) return;
+    auto pb = reinterpret_cast<CVPixelBufferRef>(pixbuf);
+    size_t w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb);
+    if (!w || !h || w > INT32_MAX / h) return;
+    jclass cls = env->GetObjectClass(texture);
+    jmethodID queue = env->GetMethodID(cls, "macapkQueueDecodedFrame", "([IIIIJ)V");
+    env->DeleteLocalRef(cls);
+    if (!queue) return;
+    jintArray pixels = env->NewIntArray((jsize)(w*h));
+    if (!pixels) return;
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        env->DeleteLocalRef(pixels); return;
+    }
+    auto* src = static_cast<const uint8_t*>(CVPixelBufferGetBaseAddress(pb));
+    size_t stride = CVPixelBufferGetBytesPerRow(pb);
+    bool copied = false;
+    if (src && stride >= w*4) {
+        auto* dst = static_cast<jint*>(env->GetPrimitiveArrayCritical(pixels, nullptr));
+        if (dst) {
+            // BGRA bytes on Apple Silicon are Android's 0xAARRGGBB int values.
+            for (size_t y=0; y<h; ++y) std::memcpy(dst+y*w, src+y*stride, w*4);
+            env->ReleasePrimitiveArrayCritical(pixels, dst, 0);
+            copied = true;
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    if (copied) env->CallVoidMethod(texture, queue, pixels, (jint)w, (jint)h, (jint)w, timestampNs);
+    env->DeleteLocalRef(pixels);
+}
+
 void Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame(JNIEnv*, jclass, jlong pixbuf) {
     macapk_vtb_release_frame((void*)(uintptr_t)pixbuf);
 }
@@ -1276,6 +1389,8 @@ static const JNINativeMethod kNativeVideoMethods[] = {
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidPoll},
     {(char*)"nativeVidRender",           (char*)"(JII)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidRender},
+    {(char*)"nativeVidRenderToTexture", (char*)"(JLandroid/graphics/SurfaceTexture;J)V",
+     (void*)Java_com_macapk_loader_NativeMedia_nativeVidRenderToTexture},
     {(char*)"nativeVidReleaseFrame",     (char*)"(J)V",
      (void*)Java_com_macapk_loader_NativeMedia_nativeVidReleaseFrame},
     {(char*)"nativeVidFrameBgra",        (char*)"(J[B[I)I",
