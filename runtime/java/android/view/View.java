@@ -1288,13 +1288,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
         return v;
     }
 
-    // Animation hooks. AOSP View has animate() returning a fluent
-    // ViewPropertyAnimator; we return a no-op animator so apps that
-    // chain .x().y().alpha().start() don't NPE on the first method.
+    // AOSP View.animate() retains one builder for the lifetime of the view:
+    // later animate().cancel() calls must reach the same pending/running work.
+    private android.view.ViewPropertyAnimator mPropertyAnimator;
     public android.view.ViewPropertyAnimator animate() {
-        // Tier 3 M7: pass `this` so the (now real) ViewPropertyAnimator can
-        // capture + drive this view's properties on the vsync Choreographer.
-        return new android.view.ViewPropertyAnimator(this);
+        if (mPropertyAnimator == null) mPropertyAnimator = new android.view.ViewPropertyAnimator(this);
+        return mPropertyAnimator;
     }
     /** AOSP View.clearAnimation():
      *      if (mCurrentAnimation != null) mCurrentAnimation.detach();

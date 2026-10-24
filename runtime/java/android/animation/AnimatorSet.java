@@ -9,11 +9,8 @@
 // graph and start() runs each child only once all its predecessors have ENDED
 // (chained via the M7 Choreographer-driven ValueAnimator's onAnimationEnd).
 //
-// Gated on MACAPK_REAL_LOOPER: flag-OFF keeps the legacy "start all at once"
-// behavior (children snap to end there anyway, so the end state is identical),
-// so the shipped build is byte-for-byte unchanged; the real sequencing runs
-// only on the experimental real-loop path where the child animators actually
-// tick over time.
+// Dependency sequencing is gated on MACAPK_REAL_LOOPER. Flag-OFF children
+// still start together and snap to end; both paths track the set lifecycle.
 package android.animation;
 
 import java.util.ArrayList;
@@ -125,7 +122,69 @@ public final class AnimatorSet extends Animator {
         return e;
     }
 
-    private int remaining;   // children not yet ended (real-loop path)
+    // AOSP AnimatorSet.cancel() acts only on a started set; endAnimation()
+    // clears its started state before notifying end listeners. Keep the graph
+    // and listener in a per-run object so completion observers can restart the
+    // set without old callbacks advancing or completing the new run.
+    private Run activeRun;
+
+    private final class Run extends AnimatorListenerAdapter {
+        final List<Animator> children = new ArrayList<>(nodes);
+        final Map<Animator, Integer> unmet = new HashMap<>();
+        final Map<Animator, List<Animator>> successors = new HashMap<>();
+        final Set<Animator> playing = new LinkedHashSet<>();
+        int remaining = children.size();
+        boolean terminating;
+
+        Run() {
+            for (Animator child : children) {
+                unmet.put(child, 0);
+                successors.put(child, new ArrayList<>());
+            }
+            if (android.os.Looper.MACAPK_REAL_LOOPER) {
+                for (Animator child : children) for (Animator predecessor : deps.get(child)) {
+                    if (!unmet.containsKey(predecessor)) continue;
+                    unmet.put(child, unmet.get(child) + 1);
+                    successors.get(predecessor).add(child);
+                }
+            }
+        }
+
+        boolean isActive() { return activeRun == this && !terminating; }
+
+        void startChild(Animator child) {
+            if (!isActive() || !playing.add(child)) return;
+            child.addListener(this);
+            child.start();
+        }
+
+        @Override public void onAnimationEnd(Animator child) {
+            child.removeListener(this);
+            if (!isActive() || !playing.remove(child)) return;
+            if (--remaining == 0) {
+                finish();
+                return;
+            }
+            for (Animator successor : successors.get(child)) {
+                int count = unmet.get(successor) - 1;
+                unmet.put(successor, count);
+                if (count == 0) startChild(successor);
+            }
+        }
+
+        void finish() {
+            if (activeRun != this) return;
+            terminating = true;
+            for (Animator child : children) child.removeListener(this);
+            playing.clear();
+            activeRun = null;
+            paused = false;
+            notifyEndListeners();
+        }
+    }
+
+    @Override public boolean isStarted() { return activeRun != null; }
+    @Override public boolean isRunning() { return activeRun != null && !activeRun.terminating; }
 
     // Wall clock of the last start(), for getCurrentPlayTime(). -1 means "never
     // started", which AOSP reports as a play time of 0.
@@ -176,87 +235,49 @@ public final class AnimatorSet extends Animator {
     }
 
     @Override public void start() {
+        if (activeRun != null) return;
         mStartTimeMillis = android.os.SystemClock.uptimeMillis();
-        if (!android.os.Looper.MACAPK_REAL_LOOPER || nodes.isEmpty()) {
-            // Legacy / flag-off: start every child (they snap to end). The end
-            // state is identical to the graph walk, so flag-off is unchanged.
-            for (Animator a : new ArrayList<>(nodes)) if (a != null) {
-                try { a.start(); } catch (Throwable ignored) {}
-            }
-            super.start();
+        paused = false;
+        if (durationSet) for (Animator child : nodes) child.setDuration(getDuration());
+        Run run = new Run();
+        activeRun = run;
+        // Snapshot roots before any child can end synchronously and change
+        // unmet counts. Otherwise a successor may be started a second time.
+        List<Animator> roots = new ArrayList<>();
+        for (Animator child : run.children) if (run.unmet.get(child) == 0) roots.add(child);
+        notifyStartListeners();
+        if (!run.isActive()) return;
+        if (run.children.isEmpty()) {
+            run.finish();
             return;
         }
-        // Real-loop path: dependency-graph sequencing.
-        if (durationSet) for (Animator a : nodes) if (a != null) a.setDuration(getDuration());
-        notifyStartListeners();
-        // Invert deps -> successors, and count each node's unmet predecessors.
-        final Map<Animator, Integer> unmet = new HashMap<>();
-        final Map<Animator, List<Animator>> succ = new HashMap<>();
-        for (Animator n : nodes) { unmet.put(n, 0); succ.put(n, new ArrayList<>()); }
-        for (Animator n : nodes) {
-            for (Animator p : deps.get(n)) {
-                if (!unmet.containsKey(p)) continue;   // predecessor not in this set -> ignore
-                unmet.put(n, unmet.get(n) + 1);
-                succ.get(p).add(n);
-            }
-        }
-        remaining = nodes.size();
-        final AnimatorListener chain = new AnimatorListenerAdapter() {
-            @Override public void onAnimationEnd(Animator child) {
-                child.removeListener(this);
-                for (Animator s : succ.get(child)) {
-                    int u = unmet.get(s) - 1;
-                    unmet.put(s, u);
-                    if (u == 0) startChild(s, this);
-                }
-                if (--remaining <= 0) AnimatorSet.this.notifyEndListeners();
-            }
-        };
-        // Start every root (no unmet predecessors). Snapshot first so a
-        // synchronous end (a child that completes inside start()) can't mutate
-        // the iteration.
-        final List<Animator> roots = new ArrayList<>();
-        for (Animator n : nodes) if (unmet.get(n) == 0) roots.add(n);
-        for (Animator n : roots) startChild(n, chain);
+        for (Animator child : roots) run.startChild(child);
     }
-    private void startChild(Animator a, AnimatorListener chain) {
-        if (a == null) return;
-        a.addListener(chain);
-        try { a.start(); } catch (Throwable t) { /* end-listener still advances the chain */ }
-    }
+
     @Override public void cancel() {
-        // AOSP AnimatorSet.cancel() (frameworks/base/core/java/android/animation/
-        // AnimatorSet.java): cancels every playing child, fires onAnimationCancel
-        // to the SET's own listeners, then unconditionally calls its private
-        // endAnimation(), which fires onAnimationEnd to the set's own listeners
-        // too -- "if (isStarted()) { ...cancel children...; endAnimation(); }".
-        // Verbatim from that file:
-        //   private void endAnimation() {
-        //       ...
-        //       if (mListeners != null) {
-        //           ...
-        //           tmpListeners.get(i).onAnimationEnd(this, mReversing);
-        //       }
-        //       ...
-        //   }
-        // notifyEndListeners() was missing here, so a listener added directly to
-        // an AnimatorSet (StateListAnimator's press/elevation AnimatorSets are a
-        // mainstream Material Components example: setState() calls
-        // runningAnimator.cancel() on every state change) never saw
-        // onAnimationEnd after a cancel -- exactly the "animation that never
-        // ends" failure shape: whatever cleanup a caller gated on the set's own
-        // end callback (re-enable a button, clear an "isAnimating" flag) never ran.
-        for (Animator a : new ArrayList<>(nodes)) if (a != null) {
-            try { a.cancel(); } catch (Throwable ignored) {}
-        }
+        Run run = activeRun;
+        if (run == null || run.terminating) return;
+        // Cancel only playing children. Detach the sequencing listener before
+        // cancelling them so their end callbacks cannot start successors. The
+        // guard also makes cancellation from an observer safe to re-enter.
+        run.terminating = true;
+        for (Animator child : run.children) child.removeListener(run);
         notifyCancelListeners();
-        notifyEndListeners();
-    }
-    @Override public void end() {
-        for (Animator a : new ArrayList<>(nodes)) if (a != null) {
-            try { a.end(); } catch (Throwable ignored) {}
+        for (Animator child : new ArrayList<>(run.playing)) {
+            try { child.cancel(); } catch (Throwable ignored) {}
         }
-        notifyEndListeners();
+        run.finish();
+    }
+
+    @Override public void end() {
+        Run run = activeRun;
+        if (run == null || run.terminating) return;
+        run.terminating = true;
+        for (Animator child : run.children) child.removeListener(run);
+        for (Animator child : run.children) {
+            try { child.end(); } catch (Throwable ignored) {}
+        }
+        run.finish();
     }
 
     /** AOSP AnimatorSet.Builder: play(a).with(b)/before(b)/after(b) wires the

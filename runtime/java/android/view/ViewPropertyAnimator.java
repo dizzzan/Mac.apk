@@ -1,12 +1,8 @@
-// android.view.ViewPropertyAnimator -- Tier 3 M7: the fluent View.animate()
-// builder, now REAL. Each chained call (translationX/alpha/rotation/...) records
-// a target; start() captures the view's current value for each, runs a
-// Choreographer-driven ValueAnimator(0->1), and on every vsync sets each property
-// = start + (target - start) * interpolatedFraction. Translation/scale/rotation
-// are rendered via the View 2D transform (ViewGroup.dispatchDraw); alpha updates
-// the View's alpha. Gated on MACAPK_REAL_LOOPER: flag-OFF keeps the historical
-// snap-to-end (apply final values + run start/end actions immediately), so the
-// shipped build is unchanged.
+// View.animate() reuses this builder. Property requests form a batch that
+// starts on the next animation frame, or immediately when start() is called.
+// Each batch owns its properties and one-shot actions; replacing a property
+// leaves unrelated properties running. ValueAnimator supplies timed frames
+// with MACAPK_REAL_LOOPER and immediate completion in the legacy mode.
 package android.view;
 
 import java.util.ArrayList;
@@ -25,7 +21,8 @@ public class ViewPropertyAnimator {
     private Runnable startAction, endAction;
     private android.animation.Animator.AnimatorListener listener;
     private android.animation.ValueAnimator.AnimatorUpdateListener updateListener;
-    private android.animation.ValueAnimator anim;
+    private final java.util.Map<android.animation.ValueAnimator, ArrayList<Prop>> running = new java.util.LinkedHashMap<>();
+    private final Runnable animationStarter = this::start;
 
     // kind: 0 x, 1 y, 2 translationX, 3 translationY, 4 scaleX, 5 scaleY, 6 alpha,
     // 7 rotation, 8 rotationX, 9 rotationY, 10 translationZ, 11 z
@@ -38,7 +35,24 @@ public class ViewPropertyAnimator {
     public ViewPropertyAnimator() { this.target = null; }
     public ViewPropertyAnimator(View target) { this.target = target; }
 
-    private ViewPropertyAnimator add(int kind, float v, boolean by) { props.add(new Prop(kind, v, by)); return this; }
+    private ViewPropertyAnimator add(int kind, float v, boolean by) {
+        // AOSP animatePropertyBy cancels only this property in older runs and
+        // posts one starter after the fluent chain. start() is optional.
+        for (android.animation.ValueAnimator old : new ArrayList<>(running.keySet())) {
+            ArrayList<Prop> oldProps = running.get(old);
+            if (oldProps != null) {
+                oldProps.removeIf(p -> p.kind == kind);
+                if (oldProps.isEmpty()) old.cancel();
+            }
+        }
+        props.removeIf(p -> p.kind == kind);
+        props.add(new Prop(kind, v, by));
+        if (target != null) {
+            target.removeCallbacks(animationStarter);
+            target.postOnAnimation(animationStarter);
+        }
+        return this;
+    }
     public ViewPropertyAnimator x(float v)               { return add(0, v, false); }
     public ViewPropertyAnimator y(float v)               { return add(1, v, false); }
     public ViewPropertyAnimator xBy(float v)             { return add(0, v, true); }
@@ -115,67 +129,61 @@ public class ViewPropertyAnimator {
     }
 
     public void start() {
-        final int n = props.size();
-        final float[] starts = new float[n];
-        final float[] ends = new float[n];
-        if (target != null) {
-            for (int i = 0; i < n; i++) {
-                Prop p = props.get(i);
-                float s = getProp(p.kind);
-                starts[i] = s;
-                ends[i] = p.by ? s + p.value : p.value;
+        if (target != null) target.removeCallbacks(animationStarter);
+        final ArrayList<Prop> batch = new ArrayList<>(props);
+        props.clear();
+        final Runnable onStart = startAction, onEnd = endAction;
+        startAction = null;
+        endAction = null;
+        if (batch.isEmpty() && onStart == null && onEnd == null) return;
+        // Each run owns its properties and one-shot actions; future fluent
+        // calls cannot mutate a running animation's targets or replay actions.
+        final java.util.Map<Prop, float[]> values = new java.util.IdentityHashMap<>();
+        for (Prop p : batch) {
+            float from = target != null ? getProp(p.kind) : 0f;
+            values.put(p, new float[]{from, p.by ? from + p.value : p.value});
+        }
+        android.animation.ValueAnimator animation = android.animation.ValueAnimator.ofFloat(0f, 1f);
+        animation.setDuration(durationMs);
+        animation.setStartDelay(startDelayMs);
+        if (interpolator != null) animation.setInterpolator(interpolator);
+        running.put(animation, batch);
+        animation.addUpdateListener(a -> {
+            float fraction = a.getAnimatedFraction();
+            if (target != null) for (Prop p : batch) {
+                float[] range = values.get(p);
+                setProp(p.kind, range[0] + (range[1] - range[0]) * fraction);
             }
-        }
-        if (target == null || !android.os.Looper.MACAPK_REAL_LOOPER) {
-            // Shipped path: snap to the final values and run actions immediately.
-            if (startAction != null) try { startAction.run(); } catch (Throwable ignored) {}
-            for (int i = 0; i < n; i++) setProp(props.get(i).kind, ends[i]);
-            if (endAction != null) try { endAction.run(); } catch (Throwable ignored) {}
-            // setListener/setUpdateListener: AOSP fires the lifecycle callbacks
-            // even for an instantaneous/duration-0 completion. Reuse
-            // ValueAnimator's own defensive per-listener notify loop (Animator
-            // .start() -> onAnimationStart then onAnimationEnd, synchronously,
-            // when MACAPK_REAL_LOOPER is off) via a throwaway instance instead
-            // of hand-rolling the same dispatch here. Kept local (never
-            // assigned to the `anim` field) so cancel() keeps its existing
-            // no-op behavior on this path, and gated on listener/updateListener
-            // being non-null so every pre-existing call site (which could not
-            // have set either, since the methods did not exist before) takes
-            // the exact same path as before, unchanged.
-            if (listener != null || updateListener != null) {
-                try {
-                    android.animation.ValueAnimator snap = android.animation.ValueAnimator.ofFloat(0f, 1f);
-                    snap.setDuration(durationMs);
-                    if (updateListener != null) snap.addUpdateListener(updateListener);
-                    if (listener != null) snap.addListener(listener);
-                    snap.start();
-                } catch (Throwable ignored) {}
-            }
-            return;
-        }
-        if (startAction != null) try { startAction.run(); } catch (Throwable ignored) {}
-        anim = android.animation.ValueAnimator.ofFloat(0f, 1f);
-        anim.setDuration(durationMs);
-        anim.setStartDelay(startDelayMs);
-        if (interpolator != null) {
-            anim.setInterpolator(interpolator);
-        }
-        anim.addUpdateListener(a -> {
-            float f = a.getAnimatedFraction();
-            for (int i = 0; i < n; i++) setProp(props.get(i).kind, starts[i] + (ends[i] - starts[i]) * f);
+            if (updateListener != null) updateListener.onAnimationUpdate(a);
         });
-        if (updateListener != null) anim.addUpdateListener(updateListener);
-        anim.addListener(new android.animation.Animator.AnimatorListenerAdapter() {
+        animation.addListener(new android.animation.AnimatorListenerAdapter() {
+            boolean cancelled;
+            @Override public void onAnimationStart(android.animation.Animator a) {
+                if (listener != null) listener.onAnimationStart(a);
+                if (onStart != null) onStart.run();
+            }
+            @Override public void onAnimationCancel(android.animation.Animator a) {
+                cancelled = true;
+                if (listener != null) listener.onAnimationCancel(a);
+            }
             @Override public void onAnimationEnd(android.animation.Animator a) {
-                for (int i = 0; i < n; i++) setProp(props.get(i).kind, ends[i]);
-                if (endAction != null) try { endAction.run(); } catch (Throwable ignored) {}
+                running.remove(animation);
+                // ValueAnimator already applied the last frame. Cancellation
+                // must retain the current value and suppress withEndAction.
+                if (listener != null) listener.onAnimationEnd(a);
+                if (!cancelled && onEnd != null) onEnd.run();
             }
         });
-        if (listener != null) anim.addListener(listener);
-        anim.start();
+        animation.start();
     }
 
-    public void cancel() { if (anim != null) anim.cancel(); }
+    public void cancel() {
+        if (target != null) target.removeCallbacks(animationStarter);
+        props.clear();
+        startAction = null;
+        endAction = null;
+        for (android.animation.ValueAnimator animation : new ArrayList<>(running.keySet())) animation.cancel();
+    }
     public long getDuration() { return durationMs; }
     public long getStartDelay() { return startDelayMs; }
 }
