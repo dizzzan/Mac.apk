@@ -275,6 +275,32 @@ signed test bundles are not included in this repository checkpoint.
 
 ## Remaining experimental scope
 
+### Device environment warning diagnosis (2026-10-24)
+
+The warning remains unresolved. Read-only inspection of the running 14.6.1
+test session found the legacy emulator result true, the newer result false
+(confidence 0), and runtime-tamper risk 20, below the mask threshold 80.
+The active configuration selects protection level `Any` and disables the newer
+emulator result. The legacy result activates the mask in protected live rooms;
+the same handler also mutes their audio.
+
+The legacy heuristic's reconstructed score is 8 (threshold >3): missing build
+flavor and board-platform properties, seven sensors, a zero package-shell user
+app count, no rear camera, no camera flash, no Bluetooth feature, and no default
+light sensor. The current model/manufacturer/hardware strings do not match its
+explicit emulator blacklist. Adding the two properties alone would still score
+6. Camera direction and unsupported Bluetooth/light features must remain
+accurate to their backends rather than claim hardware to change this score.
+
+The separate constant-accelerometer diagnostic and unsupported abstract-socket
+flag are not the inputs driving the inspected mask. No application checks,
+configuration, capability flags, or identity values were changed during this
+diagnosis. Comparison with the owner's working emulator and Clapper version is
+still needed. Private inspection agents, app bytecode, account data and logs
+remain outside this repository.
+
+### Native runtime hardening
+
 Execution copies remain opt-in. Before upstream submission, improve concurrent
 code-rewrite/publication handling, reclamation of inactive guard records,
 unload/address-reuse behavior, and unsupported instruction-page handling.
