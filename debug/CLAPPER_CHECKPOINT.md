@@ -1,9 +1,13 @@
-# Clapper playback checkpoint — 2026-10-23
+# Clapper compatibility checkpoint — 2026-10-24
 
 Clapper 14.6.1 reaches the feed, plays video continuously with sound, and switches
 between clips. The owner confirmed **smooth playback and synchronized sound**
 after the MediaCodec input-buffer fix. This is a fork checkpoint, not an upstream
 PR or a claim of compatibility with all applications.
+
+The explicit mock-input profile below also resolves the environment warning in
+the supplied protected live example. The owner confirmed video and sound work
+without the warning. Long-running native decoder stability is still experimental.
 
 ## Live playback work — 2026-10-24
 
@@ -78,8 +82,8 @@ copies 224 MiB apart and non-executable original pages. All six paths preserve
 the original LR, scratch registers, flags and stack over 1,000 repetitions
 without a signal handler. The complete 13-fixture native gate passes. In the
 updated live run Agora reported its first rendered frames after about two
-seconds; continuous usable playback remains unverified because of the warning
-and silent audio. This is not a claim that Clapper's environment check is fixed.
+seconds. At that checkpoint, the warning and silent audio still prevented
+confirmation in protected rooms; the later mock-profile result is below.
 
 A subsequent fresh session with the same build showed live video and controls;
 OpenSL ES opened a real 48 kHz stereo output and continuously consumed queued
@@ -87,8 +91,9 @@ audio buffers. The owner confirmed **"Video moves with sound."** No additional
 audio implementation change was needed. An intervening session stopped audio
 and left its channel while showing a content-warning screen, so that trace was
 not used as evidence of an audio-backend defect. Live video and audio therefore
-work in the confirmed session; the environment warning seen in other sessions
-remains unresolved, and broad live-stream compatibility is not established.
+worked in that confirmed session. The warning in other sessions was resolved
+later with the selected mock profile; broad live-stream compatibility remains
+under validation.
 
 ## Loading overlay lifetime
 
@@ -277,8 +282,8 @@ signed test bundles are not included in this repository checkpoint.
 
 ### Device environment warning diagnosis (2026-10-24)
 
-The warning remains unresolved. Read-only inspection of the running 14.6.1
-test session found the legacy emulator result true, the newer result false
+The initial warning was traced using read-only inspection of the running 14.6.1
+test session, which found the legacy emulator result true, the newer result false
 (confidence 0), and runtime-tamper risk 20, below the mask threshold 80.
 The active configuration selects protection level `Any` and disables the newer
 emulator result. The legacy result activates the mask in protected live rooms;
@@ -289,14 +294,14 @@ flavor and board-platform properties, seven sensors, a zero package-shell user
 app count, no rear camera, no camera flash, no Bluetooth feature, and no default
 light sensor. The current model/manufacturer/hardware strings do not match its
 explicit emulator blacklist. Adding the two properties alone would still score
-6. Camera direction and unsupported Bluetooth/light features must remain
-accurate to their backends rather than claim hardware to change this score.
+6. The initial runtime had no light or Bluetooth provider. The explicitly
+selected mock inputs described below now supply those simulated capabilities.
 
 The separate constant-accelerometer diagnostic and unsupported abstract-socket
 flag are not the inputs driving the inspected mask. No application checks,
 configuration, capability flags, or identity values were changed during this
-diagnosis. Comparison with the owner's working emulator and Clapper version is
-still needed. Private inspection agents, app bytecode, account data and logs
+diagnosis. The owner confirmed the same app version works in another emulator,
+but comparison access is unavailable; the fix used local evidence. Private inspection agents, app bytecode, account data and logs
 remain outside this repository.
 
 ### User-selected display identity / Android version experiment (2026-10-24)
@@ -346,13 +351,51 @@ software orientation. The old upload deterministically fails with error 0x502.
 The existing `native_texture_window_gate.py` also passes.
 
 The owner confirmed the previously black Tencent live now plays **upright with
-sound**. The recurring GL errors are absent. The protection warning remains
-active in the supplied protected Agora room and is a separate issue. These
+sound**. The recurring GL errors are absent. The protection warning was still
+active in the supplied protected Agora room at this rendering checkpoint. These
 changes do not modify app checks, protection settings, or secure-window capture.
 
 Earlier API 36 sessions ended in `liteav_video_decoder` SIGSEGV/SIGBUS faults,
 including a failure while restarting the decoder. The texture fix is not yet
 proof that these independent native stability failures are resolved.
+
+### Explicit mock phone inputs (2026-10-24)
+
+The owner requested simulated sensors for a Mac mini with no sensor hardware.
+`MACAPK_MOCK_SENSORS=1` adds the six environment/position inputs offered by
+Android Emulator's Additional Sensors panel: light, proximity, magnetic field,
+pressure, ambient temperature and relative humidity. The existing seven motion
+sensors remain, giving a 13-sensor catalog. Names explicitly identify simulation.
+Java listeners, PackageManager features and NDK sensor queues use the same
+catalog and samples. On-change inputs emit an initial event on enable and then
+only changed values; continuous inputs keep their requested cadence.
+
+`MACAPK_MOCK_BLUETOOTH=1` separately presents a simulated powered-off adapter.
+It always reports STATE_OFF, no bonds, no discovery, no scanner/advertiser and
+no successful connection. It is not a macOS Bluetooth bridge. Both options are
+off by default and contain no application-specific branches. The local Clapper
+launcher enables both; TikTok's bundle and data remain unchanged.
+
+The property store now supplies `ro.build.flavor=macapk-user` and
+`ro.board.platform=apple_silicon` from the existing runtime build/hardware
+identity, consistently to Java and native callers. With the selected mock
+profile, the legacy heuristic's missing-capability score falls from 8 to 3.
+Read-only inspection of the same previously affected protected live room found
+`isEmulator=false`, `isEmulatorNew=false` and the warning state false; protection
+configuration and runtime-tamper score (20) stayed unchanged. The owner confirmed:
+**“Warning gone; video and sound work.”** No app binary, warning handler, server
+configuration or attestation token was modified.
+
+Validation: Java/native builds pass; `debug/mock_sensors_gate.py` passes six
+fresh-JVM runs (307 Java assertions plus real NDK queue checks). It covers the
+default catalog, feature agreement, dimensions/units, timestamp base, Handler
+thread, initial/change-only events, separate native consumers, unregister and
+re-enable, continuous delivery, configurable readings and rejected invalid input.
+The identity gate passes 13 fresh JVMs with 21 checks each. Existing native build
+warnings about dependencies targeting a newer macOS version remain.
+
+See [DEVICE_IDENTITY.md](DEVICE_IDENTITY.md) for the optional simulation settings.
+Long-running native decoder stability remains experimental as noted above.
 
 ### Native runtime hardening
 

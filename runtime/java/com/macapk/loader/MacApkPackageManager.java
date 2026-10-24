@@ -4362,6 +4362,11 @@ public final class MacApkPackageManager extends PackageManager {
         // its has-compass branch and NPEs. Two commits, each coherent against a
         // different snapshot of the other file, produced a lie neither intended.
         f.addAll(android.hardware.SensorManager.macapkSensorFeatures());
+        // An explicitly simulated, powered-off controller is available only
+        // when the matching BluetoothAdapter exists. No LE capability is
+        // claimed; the virtual controller cannot scan, advertise or connect.
+        if (android.bluetooth.BluetoothAdapter.macapkHasAdapter())
+            f.add("android.hardware.bluetooth");
         // FEATURE_FAKETOUCH. AOSP: "All devices that support
         // android.hardware.touchscreen or a sub-feature are presumed to also
         // support faketouch", and its definition ("might use a mouse ... and

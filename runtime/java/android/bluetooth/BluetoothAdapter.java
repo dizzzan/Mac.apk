@@ -11,9 +11,19 @@ package android.bluetooth;
 public class BluetoothAdapter {
     public BluetoothAdapter() {}
 
-    /** No Bluetooth adapter is exposed to guest apps. AOSP returns null
-     *  here on devices/contexts without Bluetooth; we always do. */
-    public static BluetoothAdapter getDefaultAdapter() { return null; }
+    // Optional virtual-phone controller, initially and permanently powered off.
+    // This is an explicit simulation, not macOS radio passthrough: discovery,
+    // connections and advertising cannot succeed. Keep the default no-adapter
+    // behavior. Android permits a device with FEATURE_BLUETOOTH to have its
+    // adapter switched off; every API below must describe that same state.
+    private static final BluetoothAdapter MOCK_ADAPTER =
+            "1".equals(System.getenv("MACAPK_MOCK_BLUETOOTH")) ? new BluetoothAdapter() : null;
+
+    public static boolean macapkHasAdapter() { return MOCK_ADAPTER != null; }
+
+    /** AOSP returns null with no adapter. Explicit simulation exposes an
+     *  off adapter; it does not enable macOS Bluetooth passthrough. */
+    public static BluetoothAdapter getDefaultAdapter() { return MOCK_ADAPTER; }
 
     public boolean isEnabled()       { return false; }
     public int     getState()        { return STATE_OFF; }
@@ -115,7 +125,7 @@ public class BluetoothAdapter {
     }
 
     public android.bluetooth.le.BluetoothLeScanner getBluetoothLeScanner() {
-        return new android.bluetooth.le.BluetoothLeScanner();
+        return null; // AOSP: no scanner while STATE_OFF.
     }
 
     /**

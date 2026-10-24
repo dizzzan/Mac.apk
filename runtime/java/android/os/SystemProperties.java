@@ -70,6 +70,9 @@ public class SystemProperties {
         // native reader's clock wrong by a factor of 1000.
         KNOWN.put("ro.build.date.utc",                    Long.toString(Build.TIME / 1000L));
         KNOWN.put("ro.build.type",                        Build.TYPE);
+        // AOSP buildinfo.sh emits the product/variant flavor. Mac.apk already
+        // supplies both components; an absent property contradicted that build.
+        KNOWN.put("ro.build.flavor",                      Build.PRODUCT + "-" + Build.TYPE);
         KNOWN.put("ro.build.user",                        Build.USER);
         KNOWN.put("ro.build.host",                        Build.HOST);
         KNOWN.put("ro.build.tags",                        Build.TAGS);
@@ -87,6 +90,7 @@ public class SystemProperties {
         KNOWN.put("ro.product.board",                     Build.BOARD);
         KNOWN.put("ro.bootloader",                        Build.BOOTLOADER);
         KNOWN.put("ro.hardware",                          Build.HARDWARE);
+        KNOWN.put("ro.board.platform",                    Build.HARDWARE);
         // ---- ABIs. abilist32 is PRESENT WITH AN EMPTY VALUE on a 64-only device,
         // not absent: init sets all three base keys unconditionally.
         KNOWN.put("ro.product.cpu.abi",                   Build.CPU_ABI);

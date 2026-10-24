@@ -198,6 +198,9 @@ struct Enabled_ {
     MacApkSensor* sensor;
     int64_t period_ns;
     int64_t next_due_ns;   // host steady clock
+    bool sampled = false;
+    bool pending = false;
+    ASensorEvent latest{};
 };
 struct MacApkQueue {
     std::mutex mu;
@@ -238,6 +241,8 @@ void Drain(MacApkQueue* q) {
     q->pending_bytes.store(0);
 }
 
+bool Sample(JNIEnv* env, MacApkSensor* s, ASensorEvent* out, jfloatArray fa, jlongArray la);
+
 void TickerMain(MacApkQueue* q) {
     pthread_setname_np("macapk-sensor-tick");
     while (!q->stop.load()) {
@@ -245,9 +250,35 @@ void TickerMain(MacApkQueue* q) {
         bool due = false;
         {
             std::lock_guard<std::mutex> lk(q->mu);
-            for (const Enabled_& e : q->enabled) {
+            for (Enabled_& e : q->enabled) {
                 int64_t d = e.next_due_ns - now;
-                if (d <= 0) due = true;
+                // On-change inputs are polled here so an unchanged value does
+                // not repeatedly wake ALooper or appear in getEvents. Keep the
+                // latest pending value per enabled sensor, like a bounded HAL
+                // queue; a fresh enable always gets its own initial sample.
+                if (e.sensor->reporting_mode == 1) {
+                    if (d <= 0) {
+                        e.next_due_ns = now + std::max(e.period_ns, int64_t{16'000'000});
+                        EnvGuard g;
+                        if (g.env && g_sm) {
+                            jfloatArray fa = g.env->NewFloatArray(16);
+                            jlongArray la = g.env->NewLongArray(1);
+                            ASensorEvent sample{};
+                            if (fa && la && Sample(g.env, e.sensor, &sample, fa, la)
+                                    && (!e.sampled || std::memcmp(sample.data, e.latest.data,
+                                                                 sizeof sample.data) != 0)) {
+                                e.latest = sample;
+                                e.sampled = e.pending = true;
+                            }
+                            if (g.env->ExceptionCheck()) g.env->ExceptionClear();
+                            if (fa) g.env->DeleteLocalRef(fa);
+                            if (la) g.env->DeleteLocalRef(la);
+                        }
+                    }
+                    if (e.pending) due = true;
+                    d = e.next_due_ns - now;
+                    if (d > 0 && d < wait_ns) wait_ns = d;
+                } else if (d <= 0) due = true;
                 else if (d < wait_ns) wait_ns = d;
             }
         }
@@ -448,6 +479,7 @@ extern "C" int __macapk_arm64_ASensorEventQueue_hasEvents(void* queue) {
 extern "C" long __macapk_arm64_ASensorEventQueue_getEvents(void* queue, void* events, size_t count) {
     MacApkQueue* q = AsQueue(queue);
     if (!q || !events) return -22;
+    if (count == 0) return 0;
     static std::atomic<bool> first{true};
     if (first.exchange(false)) {
         char tn[64] = {0};
@@ -456,11 +488,17 @@ extern "C" long __macapk_arm64_ASensorEventQueue_getEvents(void* queue, void* ev
     }
     Drain(q);
     std::vector<MacApkSensor*> due;
+    auto* out = static_cast<ASensorEvent*>(events);
+    long n = 0;
     int64_t now = NowNs();
     {
         std::lock_guard<std::mutex> lk(q->mu);
         for (Enabled_& e : q->enabled) {
-            if (due.size() >= count) break;
+            if (due.size() + static_cast<size_t>(n) >= count) break;
+            if (e.sensor->reporting_mode == 1) {
+                if (e.pending) { out[n++] = e.latest; e.pending = false; }
+                continue;
+            }
             if (e.next_due_ns > now) continue;
             due.push_back(e.sensor);
             // Next deadline from the old one, not from now, so the long-run
@@ -469,14 +507,12 @@ extern "C" long __macapk_arm64_ASensorEventQueue_getEvents(void* queue, void* ev
             if (e.next_due_ns <= now) e.next_due_ns = now + e.period_ns;
         }
     }
-    if (due.empty()) return 0;
+    if (due.empty()) return n;
     EnvGuard g;
     JNIEnv* env = g.env;
-    if (!env || !g_sm) return 0;
+    if (!env || !g_sm) return n;
     jfloatArray fa = env->NewFloatArray(16);
     jlongArray la = env->NewLongArray(1);
-    long n = 0;
-    auto* out = static_cast<ASensorEvent*>(events);
     for (MacApkSensor* s : due) {
         if (Sample(env, s, &out[n], fa, la)) n++;
     }

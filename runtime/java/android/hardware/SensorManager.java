@@ -169,6 +169,10 @@ public class SensorManager {
     //     docs/tilt-control_2026-10-02.md): with it on, these values ARE user
     //     input. With it off, this comment remains the honesty the owner asked for.
     //
+    // MACAPK_MOCK_SENSORS=1 explicitly opts into simulated environment inputs
+    // on hosts without this hardware. MockSensors labels and documents these
+    // as simulation, and backs the catalog, Java events and NDK events together.
+    // The missing-hardware policy above continues to apply to the default mode.
     // Do not "improve" the zeros back into plausible values. A plausible lie is
     // strictly worse than an obvious one: it is what let the fabricated pressure
     // and humidity readings sit here unnoticed.
@@ -203,6 +207,7 @@ public class SensorManager {
         mSensors.add(new Sensor(Sensor.TYPE_ORIENTATION, "Mac.apk Orientation",
             Sensor.STRING_TYPE_ORIENTATION, 360f, 0.1f, 0.1f,
             10000, Sensor.REPORTING_MODE_CONTINUOUS));
+        mSensors.addAll(MockSensors.catalog());
         // No TYPE_STEP_COUNTER / TYPE_STEP_DETECTOR: a Mac has no pedometer.
         // getDefaultSensor(TYPE_STEP_COUNTER) is THE feature-detection idiom
         // ("non-null means this device counts steps"), and an Android device
@@ -362,15 +367,23 @@ public class SensorManager {
     /** The one place the catalog's membership is written down. The instance
      *  constructor builds its Sensor objects from these same types, so adding or
      *  removing a sensor moves BOTH the catalog and the advertised features. */
-    static final int[] MACAPK_CATALOG_TYPES = {
-        Sensor.TYPE_ACCELEROMETER,
-        Sensor.TYPE_GYROSCOPE,
-        Sensor.TYPE_GRAVITY,
-        Sensor.TYPE_LINEAR_ACCELERATION,
-        Sensor.TYPE_ROTATION_VECTOR,
-        Sensor.TYPE_GAME_ROTATION_VECTOR,
-        Sensor.TYPE_ORIENTATION,
-    };
+    static final int[] MACAPK_CATALOG_TYPES = macapkCatalogTypes();
+
+    private static int[] macapkCatalogTypes() {
+        int[] motion = {
+            Sensor.TYPE_ACCELEROMETER,
+            Sensor.TYPE_GYROSCOPE,
+            Sensor.TYPE_GRAVITY,
+            Sensor.TYPE_LINEAR_ACCELERATION,
+            Sensor.TYPE_ROTATION_VECTOR,
+            Sensor.TYPE_GAME_ROTATION_VECTOR,
+            Sensor.TYPE_ORIENTATION,
+        };
+        List<Sensor> mock = MockSensors.catalog();
+        int[] types = java.util.Arrays.copyOf(motion, motion.length + mock.size());
+        for (int i = 0; i < mock.size(); i++) types[motion.length + i] = mock.get(i).getType();
+        return types;
+    }
 
     // ---- the ORIGINAL (API 1) SensorListener API -------------------------
     //
@@ -513,6 +526,7 @@ public class SensorManager {
          *  to the same Looper and post through it. */
         final android.os.Handler handler;
         long lastDeliveryNanos;
+        float[] lastValues;
         /** Last accuracy handed to onAccuracyChanged. AOSP tracks this in a
          *  SparseIntArray whose absent-key read is 0, and fires the callback
          *  only when the incoming accuracy differs -- so it lands once, on the
@@ -605,6 +619,15 @@ public class SensorManager {
             r.lastDeliveryNanos = now;
             final SensorEvent ev = makeEvent(r.sensor, now);
             if (ev == null) { r.inFlight.set(false); continue; }
+            // AOSP on-change sensors send an initial sample after enabling,
+            // then only changed values. Each registration owns this history.
+            if (r.sensor.getReportingMode() == Sensor.REPORTING_MODE_ON_CHANGE) {
+                if (java.util.Arrays.equals(r.lastValues, ev.values)) {
+                    r.inFlight.set(false);
+                    continue;
+                }
+                r.lastValues = ev.values.clone();
+            }
             // Synthesis happens on this timer thread; DELIVERY happens on the
             // registration's Looper, per AOSP's one-Looper-per-listener rule.
             // A fresh SensorEvent per tick is what makes that safe -- nothing
@@ -791,6 +814,7 @@ public class SensorManager {
         // and the at-rest synthesis below runs exactly as before.
         SensorEvent ev = com.macapk.loader.TiltControl.isEnabled()
                 ? macapkTiltEvent(s.getType(), nowNanos) : null;
+        if (ev == null) ev = MockSensors.sample(s.getType());
         if (ev == null) switch (s.getType()) {
             case Sensor.TYPE_ACCELEROMETER:
             case Sensor.TYPE_GRAVITY:

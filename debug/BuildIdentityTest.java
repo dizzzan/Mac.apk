@@ -27,6 +27,8 @@ public class BuildIdentityTest {
         equal(fingerprint, SystemProperties.get("ro.system.build.fingerprint"), "partition property");
         equal(fingerprint, Build.getFingerprintedPartitions().get(0).getFingerprint(), "partition API");
         equal("apple_silicon", Build.HARDWARE, "host hardware");
+        equal("apple_silicon", SystemProperties.get("ro.board.platform"), "board platform");
+        equal("macapk-user", SystemProperties.get("ro.build.flavor"), "build flavor");
         equal("arm64-v8a", Build.CPU_ABI, "native ABI");
         equal("unknown", Build.SERIAL, "serial");
         equal(null, Build.getRadioVersion(), "baseband");
