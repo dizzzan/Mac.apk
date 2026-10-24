@@ -39,7 +39,8 @@ field's clipped bounds. UI compositor canvases now report the current view's
 recording dimensions during that view's draw, matching AOSP View's per-view
 RenderNode.beginRecording(width, height). Nested scopes and exceptions restore
 the parent dimensions; ordinary bitmap canvases retain their original behavior.
-The rebuilt app is awaiting the owner's authenticated sign-in test.
+The owner confirmed that the digits now appear and email sign-in completes.
+The debug app was left running in its authenticated session.
 
 The regression fails on the previous implementation and passes all 13 checks
 with the fix, including touch routing, hide/show lifecycle counts, dismiss while
