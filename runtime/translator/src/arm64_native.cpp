@@ -11259,7 +11259,11 @@ size_t Image::apply_svc_brk_rewrite() {
         uint8_t* hi = lo + ph.p_filesz;
         std::vector<macapk::a64::InlineDataRange> inline_data;
         if (std::getenv("MACAPK_SVC_INLINE_DATA"))
-            inline_data = macapk::a64::lr_skipped_ranges(lo, ph.p_filesz, (uint64_t)lo);
+            inline_data = macapk::a64::lr_skipped_ranges(lo, ph.p_filesz, (uint64_t)lo,
+                [&](uint64_t pc) {
+                    bool unknown = false;
+                    return !text_word_is_data(pc - reinterpret_cast<uint64_t>(base_), &unknown);
+                });
         size_t seg_n = 0;
         for (uint32_t* p = reinterpret_cast<uint32_t*>(lo);
              reinterpret_cast<uint8_t*>(p + 1) <= hi; ++p) {

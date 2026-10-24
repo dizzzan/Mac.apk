@@ -75,5 +75,18 @@ int main() {
     check(contains(c, 0x10), "incoming edge at destination is safe");
     c = fixture(); c[16] = 0x30fffe80; // ADR x0,0x11
     check(contains(c, 0x10), "unaligned data address is not an instruction entry");
+    // The same aligned ADR bit pattern in a known non-executable ELF section
+    // cannot make skipped data executable. With no section evidence, keep it.
+    c = fixture(); c[16] = 0x10fffe80; // ADR x0,0x10
+    auto filtered = macapk::a64::lr_skipped_ranges(reinterpret_cast<const uint8_t*>(c.data()),
+        c.size() * 4, base, [](uint64_t pc) { return pc != base + 0x40; });
+    bool found = false;
+    for (auto r : filtered) if (base + 0x10 >= r.lo && base + 0x10 < r.hi) found = true;
+    check(found, "ADR-shaped rodata does not invent a code entry");
+    check(!contains(c, 0x10), "unknown section evidence still preserves possible code entries");
+    c = fixture();
+    filtered = macapk::a64::lr_skipped_ranges(reinterpret_cast<const uint8_t*>(c.data()),
+        c.size() * 4, base, [](uint64_t pc) { return pc < base + 0x20 || pc >= base + 0x38; });
+    check(filtered.empty(), "helper-shaped rodata is not a callable leaf");
     std::printf("%d inline-data checks passed\n", checks);
 }
