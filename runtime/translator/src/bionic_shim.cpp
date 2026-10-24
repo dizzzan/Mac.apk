@@ -28489,6 +28489,7 @@ extern "C" size_t __macapk_host_jvm_attach_reserve(void) {
 // file; called from macapk_thread_trampoline() below, which runs before
 // either map is declared textually.
 static void macapk_unregister_guest_tid();
+static void macapk_register_guest_tid(pthread_t pt);
 
 // ---- Gated Bedrock-worker CAP (MACAPK_WP_WORKER_CAP=N, default OFF) -----------
 // *** NON-VIABLE AS A FIX (v643, breaks boot) -- kept as a gated DIAGNOSTIC only. ***
@@ -28584,6 +28585,11 @@ static void* macapk_thread_trampoline(void* p) {
     macapk_enable_x18_preservation();
     t_pthread_entry = reinterpret_cast<uintptr_t>(fn);
     t_is_guest = 1;   // v1.0.645: mark this as a guest thread (foreign-wake defer)
+    // A detached worker can finish before pthread_create returns to its caller.
+    // Query and register its ID here, while pthread_self() is still alive,
+    // rather than dereferencing a potentially freed pthread_t in the creator.
+    // Registration also precedes any guest setpriority(gettid(), ...) call.
+    macapk_register_guest_tid(pthread_self());
     // Gated worker cap (time-gated): tag this thread as an "excess" pool worker if its start
     // routine has already started >= N threads. Do NOT park here (boot needs the workers) --
     // excess workers park later at their idle cond_wait, only during the cap window.
@@ -31542,7 +31548,6 @@ extern "C" int __macapk_arm64_pthread_create(
         }
     }
     if (rc == 0) {
-        macapk_register_guest_tid(pt);          // for per-thread setpriority
         if (thread) *thread = reinterpret_cast<unsigned long>(pt);
     }
     return rc;
@@ -45060,6 +45065,28 @@ extern "C" int __macapk_arm64___sched_cpucount(size_t set_size,
     return count;
 }
 
+// Bionic sched_getcpu() wraps __getcpu(). Darwin exposes the same instantaneous
+// CPU query through pthread_cpu_number_np, but returns an error number directly.
+// Keep the reported index inside the guest topology when NPROC_OVERRIDE is set.
+extern "C" int __macapk_arm64_sched_getcpu() {
+    size_t cpu = 0;
+    const int error = ::pthread_cpu_number_np(&cpu);
+    if (error) { errno = errno_mac2lin(error); return -1; }
+    const long ncpu = macapk_arm64_ncpu();
+    return int(cpu % size_t(ncpu > 0 ? ncpu : 1));
+}
+
+static inline void* macapk_untag_ptr(const void* p);   // Android heap tag; see macapk_tag_ptr
+extern "C" int __macapk_arm64___getcpu(unsigned* cpu, unsigned* node,
+                                         void* /*unused_cache*/) {
+    const int current = __macapk_arm64_sched_getcpu();
+    if (current < 0) return -1;
+    if (cpu) *static_cast<unsigned*>(macapk_untag_ptr(cpu)) = unsigned(current);
+    // The guest exposes one NUMA node, including on Apple Silicon clusters.
+    if (node) *static_cast<unsigned*>(macapk_untag_ptr(node)) = 0;
+    return 0;
+}
+
 // sched_getaffinity(pid, set_size, set) -- report the caller as runnable
 // on every online CPU and return 0 (bionic returns 0 on success). Mirror
 // of the raw syscall(123) fill; libEOSSDK imports the libc symbol form.
@@ -45132,7 +45159,6 @@ extern "C" int __macapk_arm64_pthread_setschedparam(
 
 // malloc_usable_size(ptr) -- bionic returns the usable size of an
 // allocation (0 for NULL). macOS's equivalent is malloc_size().
-static inline void* macapk_untag_ptr(const void* p);   // Android heap tag; see macapk_tag_ptr
 extern "C" size_t __macapk_arm64_malloc_usable_size(void* p) {
     p = macapk_untag_ptr(p);       // malloc_size() hashes the address, so untag first
     return p ? malloc_size(p) : 0;
@@ -48791,6 +48817,9 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
     // printed a negative. Untagging here is the bridge between the two ABIs and belongs at
     // this boundary, which is the only place the guest's pointers cross into the host kernel.
     switch (number) {
+        case 168:  // SYS_getcpu on Linux aarch64 (both output pointers optional)
+            return __macapk_arm64___getcpu(reinterpret_cast<unsigned*>(a1),
+                                           reinterpret_cast<unsigned*>(a2), nullptr);
         case 178: {  // SYS_gettid on Linux aarch64
             uint64_t tid = 0;
             pthread_threadid_np(nullptr, &tid);
