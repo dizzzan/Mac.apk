@@ -794,7 +794,7 @@ public final class MediaCodec {
                         outIdx = r;
                         info = tmp;
                     } else if (!mInFree.isEmpty()) {
-                        inIdx = mInFree.poll();
+                        inIdx = takeInputBufferLocked();
                     }
                 }
             }
@@ -866,7 +866,12 @@ public final class MediaCodec {
 
     public ByteBuffer[] getInputBuffers()  { return mIn  != null ? mIn  : new ByteBuffer[0]; }
     public ByteBuffer[] getOutputBuffers() { return mOut != null ? mOut : new ByteBuffer[0]; }
-    public ByteBuffer getInputBuffer(int index)  { return (mIn  != null && index >= 0 && index < mIn.length)  ? mIn[index]  : null; }
+    public ByteBuffer getInputBuffer(int index) {
+        synchronized (mAsyncLock) {
+            if (mIn == null || index < 0 || index >= mIn.length) return null;
+            return mIn[index].clear();
+        }
+    }
     // AOSP: "the ByteBuffer... will be null if configured with an output
     // surface". Even without a surface our video output is an opaque native
     // pixel buffer with no meaningful ByteBuffer view -- use getOutputImage.
@@ -1130,8 +1135,17 @@ public final class MediaCodec {
     public int dequeueInputBuffer(long timeoutUs) {
         synchronized (mAsyncLock) {
             if (!mStarted || mInFree.isEmpty()) return INFO_TRY_AGAIN_LATER;
-            return mInFree.poll();
+            return takeInputBufferLocked();
         }
+    }
+    // AOSP clears input buffers when ownership passes to the client (including
+    // cached getInputBuffers arrays), and on each getInputBuffer call. Reusing
+    // the previous position appends the next packet after stale compressed
+    // bytes, while queueInputBuffer's offset still points at the old packet.
+    private int takeInputBufferLocked() {
+        int index = mInFree.poll();
+        mIn[index].clear();
+        return index;
     }
     public void queueInputBuffer(int index, int offset, int size, long presentationTimeUs, int flags) {
         if (PRESENT_TRACE && mIsVideo) traceIn();
