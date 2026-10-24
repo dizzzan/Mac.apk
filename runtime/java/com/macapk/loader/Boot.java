@@ -1300,6 +1300,9 @@ public final class Boot {
         // on the uncaught reports can carry the "Process: <name>" clause that
         // RuntimeInit.logUncaught prints.
         sProcessName = manifest.packageName;
+        // The java.base FileReader overlay cannot link to framework classes.
+        // Publish the same process name for its /proc/{self,pid}/cmdline view.
+        System.setProperty("macapk.process.name", sProcessName);
 
         // Components the manifest puts in a DIFFERENT process than the app's
         // default one. AOSP resolves android:process by prefixing a leading

@@ -3,8 +3,8 @@
  * java.io.FileReader. It is byte-for-byte the JDK 21 public API (five
  * constructors delegating to a FileInputStream + the inherited InputStreamReader
  * behaviour) with ONE addition: it redirects a read of the Linux procfs paths
- * /proc/self/smaps and /proc/self/maps -- which do NOT exist on macOS -- to an
- * in-memory synthesized body.
+ * /proc/self/smaps, /proc/self/maps and the current process's cmdline -- which
+ * do NOT exist on macOS -- to an in-memory synthesized body.
  *
  * WHY: macOS has no /proc, and our guest /proc synthesis lives in the Bionic
  * open() shim, which the GUEST's native code routes through -- but a Java caller
@@ -17,8 +17,8 @@
  * ExceptionInInitializerError -> System.exit(10), which blocked the logged-in
  * feed. This overlay makes that read succeed with the HOST page size (Apple
  * Silicon = 16 kB, what the guest's native memory is actually laid out on). Only
- * these two exact /proc/self paths are rewritten; every other file open is
- * untouched, so ordinary Java file I/O is unchanged. Native /proc readers keep
+ * these proc paths are rewritten; every other file open is untouched, so
+ * ordinary Java file I/O is unchanged. Native /proc readers keep
  * using the full live census through the Bionic shim.
  *
  * NO TEMP FILE (2026-09-24). The body used to be written to
@@ -85,12 +85,25 @@ public class FileReader extends InputStreamReader {
 
     private static InputStream macapkOpen(String fileName) throws FileNotFoundException {
         if (macapkIsProc(fileName)) return new ByteArrayInputStream(PROC_BODY);
+        // Crash reporters and startup monitors commonly build this path using
+        // Process.myPid(), rather than using /proc/self. Like native procfs,
+        // argv[0] is the Android process name, terminated by NUL. Read the boot
+        // property on each open: an early probe must not cache a missing name.
+        // Limit numeric paths to this PID; other processes are not this app.
+        if (fileName != null && fileName.startsWith("/proc/") && fileName.endsWith("/cmdline")
+                && (fileName.equals("/proc/self/cmdline")
+                    || fileName.equals("/proc/" + ProcessHandle.current().pid() + "/cmdline"))) {
+            String processName = System.getProperty("macapk.process.name");
+            if (processName != null && !processName.isEmpty()) {
+                return new ByteArrayInputStream((processName + '\0').getBytes(
+                        java.nio.charset.StandardCharsets.UTF_8));
+            }
+        }
         return new FileInputStream(fileName);
     }
 
     private static InputStream macapkOpen(File file) throws FileNotFoundException {
-        if (file != null && macapkIsProc(file.getPath()))
-            return new ByteArrayInputStream(PROC_BODY);
-        return new FileInputStream(file);
+        if (file == null) return new FileInputStream(file); // preserve JDK null handling
+        return macapkOpen(file.getPath());
     }
 }
