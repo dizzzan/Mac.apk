@@ -42263,6 +42263,25 @@ static bool macapk_relpath_cwd_on() {
 extern "C" const char* __macapk_android_cacerts_dir();   // bionic_shim_cacerts.cpp
 static std::string macapk_arm64_remap_path_unguarded(const char* p);
 static std::string macapk_arm64_remap_path(const char* p) {
+    // Linux starts absolute lookup at root and consumes repeated slashes and
+    // root-level "." components before looking up the first name. Do the same
+    // before matching synthetic paths, so /./proc/self/maps reaches procfs.
+    // Only consume the root prefix: collapsing dots later could skip a missing
+    // directory, lose a trailing directory requirement, or cross a symlink.
+    std::string rooted;
+    if (p && p[0] == '/') {
+        const char* first = p;
+        for (;;) {
+            while (*first == '/') ++first;
+            if (*first == '.' && (first[1] == '/' || first[1] == '\0')) ++first;
+            else break;
+        }
+        if (first != p + 1) {
+            rooted = "/";
+            rooted += first;
+            p = rooted.c_str();
+        }
+    }
     std::string out = macapk_arm64_remap_path_unguarded(p);
     macapk_store_guard(out);
     return out;
