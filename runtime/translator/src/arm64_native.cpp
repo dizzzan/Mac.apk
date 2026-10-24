@@ -638,6 +638,9 @@ public:
     ~Image();
 
 private:
+    // Guest images outlive the Mach-O wrappers that load them. Copy the name:
+    // even a wrapper string literal becomes dangling after host dlclose.
+    std::string owned_dbg_name_;
     const char* dbg_name_ = "";
 
     // The PT_LOAD bytes live in this contiguous mapping.
@@ -4982,7 +4985,8 @@ void Image::run_init_array() {
 }
 
 bool Image::load(const uint8_t* blob, size_t blob_size, const char* dbg) {
-    dbg_name_ = dbg ? dbg : "?";
+    owned_dbg_name_ = dbg ? dbg : "?";
+    dbg_name_ = owned_dbg_name_.c_str();
     page_size_ = sysconf(_SC_PAGESIZE);
 
     if (blob_size < sizeof(Elf64_Ehdr)) {
@@ -5130,7 +5134,8 @@ bool Image::load(const uint8_t* blob, size_t blob_size, const char* dbg) {
 // (both pread the fd directly, no whole-file buffer) -- confirmed against
 // aosp-mirror/platform_bionic linker/linker_phdr.cpp before writing this.
 bool Image::load_from_path(const char* so_path_rel, const char* dbg) {
-    dbg_name_ = dbg ? dbg : "?";
+    owned_dbg_name_ = dbg ? dbg : "?";
+    dbg_name_ = owned_dbg_name_.c_str();
     page_size_ = sysconf(_SC_PAGESIZE);
 
     std::string abspath = macapk_resolve_relative_so_path(so_path_rel);
@@ -15444,11 +15449,6 @@ void* __macapk_arm64_native_load_abs(const char* abs_path,
                                      const char* dbg_soname) {
     if (!abs_path || !*abs_path || abs_path[0] != '/') return nullptr;
     if (!macapk_arm64_load_prelude()) return nullptr;
-    // The Image keeps the name POINTER (dbg_name_), and this entry point's callers name an
-    // image from a std::string that dies with their loop (elfexec_main.cpp's DT_NEEDED walk,
-    // bionic_shim_elfexec.cpp's dlopen). The wrapper entry points pass string literals, so
-    // only this one copies. Leaked with the Image: images are never unloaded.
-    if (dbg_soname) dbg_soname = ::strdup(dbg_soname);
     auto img = new Image;
     // Reuses load_from_path() verbatim: macapk_resolve_relative_so_path()
     // returns an absolute fragment unchanged (see its definition), so this is

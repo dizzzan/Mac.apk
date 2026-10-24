@@ -2594,10 +2594,14 @@ static void macapk_pairip_crashdump(int sig, siginfo_t* info, void* ucontext);
 // reads and can grow when later-loaded libraries need more execution pages.
 using MacapkSyscallGuard = macapk::SyscallGuard;
 static macapk::SyscallGuardRegistry g_sc_guards;
+// A negative lookup is reusable only until a new guard or landing is published.
+static std::atomic<uint64_t> g_shadow_lookup_epoch{1};
 extern "C" void __macapk_set_shadow_landing(uintptr_t original, uintptr_t landing, uintptr_t host_return) {
     for (auto& g : g_sc_guards) if (g.lo == original && g.live.load()) {
         g.host_return.store(host_return,std::memory_order_release);
-        g.landing.store(landing, std::memory_order_release); return;
+        g.landing.store(landing, std::memory_order_release);
+        g_shadow_lookup_epoch.fetch_add(1, std::memory_order_release);
+        return;
     }
 }
 extern "C" uintptr_t __macapk_shadow_code_for(uintptr_t target) {
@@ -2608,6 +2612,7 @@ extern "C" uintptr_t __macapk_shadow_code_for(uintptr_t target) {
     return target;
 }
 extern "C" uintptr_t __macapk_shadow_landing_for(uintptr_t target) {
+    if (target & 3) return 0;
     static std::atomic<const MacapkSyscallGuard*> cache[4096]{};
     auto& c = cache[(target >> 14) & 4095];
     auto match = [&](const MacapkSyscallGuard* g) -> uintptr_t {
@@ -2617,7 +2622,21 @@ extern "C" uintptr_t __macapk_shadow_landing_for(uintptr_t target) {
         return landing ? landing + (target - g->lo) * 2 : 0;
     };
     if (uintptr_t p = match(c.load(std::memory_order_acquire))) return p;
+    // Host destinations have no guest landing. Without caching misses every
+    // guest call into libc scans all loaded executable pages, even in a tight
+    // decoder loop. Capture the epoch before scanning so concurrent publication
+    // cannot make an incomplete scan appear current.
+    struct Miss { std::atomic<uintptr_t> target{0}; std::atomic<uint64_t> epoch{0}; };
+    static thread_local Miss misses[256]{};
+    auto& miss = misses[(target >> 2) & 255];
+    uint64_t epoch = g_shadow_lookup_epoch.load(std::memory_order_acquire);
+    if (miss.epoch.load(std::memory_order_acquire) == epoch &&
+        miss.target.load(std::memory_order_relaxed) == target &&
+        miss.epoch.load(std::memory_order_acquire) == epoch) return 0;
     for (const auto& g : g_sc_guards) if (uintptr_t p = match(&g)) { c.store(&g,std::memory_order_release); return p; }
+    miss.epoch.store(0, std::memory_order_release);
+    miss.target.store(target, std::memory_order_relaxed);
+    miss.epoch.store(epoch, std::memory_order_release);
     return 0;
 }
 extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* saved_lr) {
@@ -2636,10 +2655,21 @@ extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* 
     }
     if (!e.host) return 0;
     uintptr_t lr=*saved_lr;
+    static std::atomic<const MacapkSyscallGuard*> returns[4096]{};
+    auto& cached = returns[(lr >> 14) & 4095];
+    auto host_landing = [&](const MacapkSyscallGuard* g) -> uintptr_t {
+        if (!g || (lr & 3) || lr < g->lo || lr >= g->hi || !g->live.load(std::memory_order_acquire)) return 0;
+        uintptr_t landing = g->host_return.load(std::memory_order_acquire);
+        return landing ? landing + (lr - g->lo) * 4 : 0;
+    };
+    if (uintptr_t landing = host_landing(cached.load(std::memory_order_acquire))) {
+        *saved_lr = landing;
+        return 0;
+    }
     for (const auto& g : g_sc_guards) {
-        if (lr>=g.lo && lr<g.hi && !(lr&3) && g.live.load()) {
-            uintptr_t landing=g.host_return.load(std::memory_order_acquire);
-            if (landing) *saved_lr=landing+(lr-g.lo)*4;
+        if (uintptr_t landing = host_landing(&g)) {
+            cached.store(&g, std::memory_order_release);
+            *saved_lr = landing;
             break;
         }
     }
@@ -2672,6 +2702,7 @@ static bool macapk_register_syscall_guard(uintptr_t page_lo, uintptr_t page_hi,
         std::fprintf(stderr, "[guard] allocation failed -- page %#lx NOT guarded\n", (unsigned long)page_lo);
         std::fflush(stderr); return false;
     }
+    g_shadow_lookup_epoch.fetch_add(1, std::memory_order_release);
     std::fprintf(stderr, "[guard] handler armed #%zu: page [%#lx,%#lx) shadow %#lx wrapper %#lx\n",
                  g_sc_guards.size() - 1, (unsigned long)page_lo, (unsigned long)page_hi,
                  (unsigned long)shadow_base, (unsigned long)wrapper_va);
@@ -28566,19 +28597,14 @@ static void* macapk_thread_trampoline(void* p) {
         t_wp_excess = 0;
     }
     void* rv = fn(arg);
-    // (efficiency audit 2026-07-24): the guest tid -> pthread_t /
-    // QoS-override registries below are insert-only otherwise -- a
-    // thread-churning app (spawn-work-exit per task rather than a bounded
-    // pool) leaks one entry per exited thread for the rest of the process
-    // lifetime. This is the guest-thread exit boundary (mirrors the
-    // guest-entry boundary above): the thread is done running guest code
-    // and about to unwind back through pthread_create's trampoline, so
-    // its tid can never legitimately be looked up again. Erase here,
-    // mirroring g_pthread_objs' existing erase-on-destroy pattern
-    // elsewhere in this file. See
-    // docs/efficiency-native-runtime-memory_2026-07-24.md Finding 2.
+    // Bionic __pthread_start (libc/bionic/pthread_create.cpp) terminates with
+    // pthread_exit(result), rather than returning through another C frame.
+    // Generated entry routines can leave aligned local stack space behind;
+    // a host return epilogue would then restore registers from displaced slots.
+    // Finish our tid bookkeeping, then let pthread_exit perform native TLS
+    // destruction and publish the join result without that extra epilogue.
     macapk_unregister_guest_tid();
-    return rv;
+    pthread_exit(rv);
 }
 static inline bool oswait_trace_addr(const void* addr) {
     static int on = -1;
@@ -51848,6 +51874,8 @@ uint32_t __macapk_shim_poll(uint32_t fds, uint32_t nfds, uint32_t timeout,
 //   FIONREAD    int (4)      Linux 0x541B <-> macOS 0x4004667F
 //   FIONBIO     int (4)      Linux 0x5421 <-> macOS 0x8004667E
 //   FIOASYNC    int (4)      Linux 0x5452 <-> macOS 0x8004667D
+//   FIONCLEX / FIOCLEX       no payload: clear/set FD_CLOEXEC
+//                            Linux 0x5450/0x5451 <-> macOS FIONCLEX/FIOCLEX
 //   TIOCGWINSZ  struct winsize (4 x unsigned short = 8 bytes on both;
 //               Linux asm-generic/termios.h, macOS sys/ttycom.h)
 //                            Linux 0x5413 <-> macOS 0x40087468
@@ -51866,6 +51894,8 @@ constexpr uint32_t kLinuxTIOCGWINSZ = 0x5413;
 constexpr uint32_t kLinuxTIOCSWINSZ = 0x5414;
 constexpr uint32_t kLinuxFIONBIO    = 0x5421;
 constexpr uint32_t kLinuxFIOASYNC   = 0x5452;
+constexpr uint32_t kLinuxFIONCLEX   = 0x5450;
+constexpr uint32_t kLinuxFIOCLEX    = 0x5451;
 }  // namespace
 
 uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
@@ -51875,6 +51905,8 @@ uint32_t __macapk_shim_ioctl(uint32_t fd, uint32_t op, uint32_t argp,
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
         case kLinuxFIONBIO:    host_op = FIONBIO;    break;
         case kLinuxFIOASYNC:   host_op = FIOASYNC;   break;
+        case kLinuxFIONCLEX:   return static_cast<uint32_t>(::ioctl(static_cast<int>(fd), FIONCLEX));
+        case kLinuxFIOCLEX:    return static_cast<uint32_t>(::ioctl(static_cast<int>(fd), FIOCLEX));
         case kLinuxTIOCGWINSZ: host_op = TIOCGWINSZ; break;
         case kLinuxTIOCSWINSZ: host_op = TIOCSWINSZ; break;
         default: {
@@ -51909,6 +51941,8 @@ extern "C" int __macapk_arm64_ioctl(int fd, int op, void* argp) {
         case kLinuxFIONREAD:   host_op = FIONREAD;   break;
         case kLinuxFIONBIO:    host_op = FIONBIO;    break;
         case kLinuxFIOASYNC:   host_op = FIOASYNC;   break;
+        case kLinuxFIONCLEX:   host_op = FIONCLEX; argp = nullptr; break;
+        case kLinuxFIOCLEX:    host_op = FIOCLEX; argp = nullptr; break;
         case kLinuxTIOCGWINSZ: host_op = TIOCGWINSZ; break;
         case kLinuxTIOCSWINSZ: host_op = TIOCSWINSZ; break;
         default: {

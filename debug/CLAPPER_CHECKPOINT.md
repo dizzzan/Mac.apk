@@ -5,6 +5,64 @@ between clips. The owner confirmed **smooth playback and synchronized sound**
 after the MediaCodec input-buffer fix. This is a fork checkpoint, not an upstream
 PR or a claim of compatibility with all applications.
 
+## Live playback work — 2026-10-24
+
+Live support remains under validation. The original account showed Clapper's
+own "Device Environment Abnormality" overlay, with copyright-protection text,
+after video decoding had started. Its secure-window capture restriction remains
+intact. At the owner's request the active debug app's private and external data
+were cleared, and the owner completed setup with a test account.
+
+Generic media and animation fixes now cover three additional Android contracts:
+
+- AVC/HEVC MediaCodec can start without format CSD, then accept parameter sets
+  in queued buffers. VideoToolbox creates the session after complete headers
+  arrive, handles header-only buffers and early EOS, and preserves existing
+  format-CSD operation. Decoded frames go to the configured SurfaceTexture with
+  their presentation timestamps, even when another texture was created later.
+- AnimatorSet tracks each run and cancels only active children. Cancelling an
+  idle/completed set is silent; end callbacks can cancel or restart the set
+  without recursively notifying themselves or starting cancelled successors.
+- View.animate() reuses a per-view ViewPropertyAnimator. Property batches start
+  on the next animation frame without requiring explicit start(), fixing a live
+  screen left at alpha zero. Cancellation retains the current value and does
+  not run withEndAction; later batches do not replay previous actions.
+
+References: [MediaCodec CSD](https://developer.android.com/reference/android/media/MediaCodec#CSD),
+[AOSP AnimatorSet](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/animation/AnimatorSet.java),
+[AOSP ViewPropertyAnimator](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/view/ViewPropertyAnimator.java).
+The generated VideoToolbox AVC/HEVC test exercises eight header-delivery cases,
+pixel content, output identity, timestamps, flush and EOS. The animation tests
+pass 23 and 14 lifecycle checks respectively.
+
+Testing the new session exposed further native compatibility defects:
+
+- A generated pthread routine returns with an aligned 16-byte stack allocation
+  still present. Returning through Mac.apk's host trampoline restored registers
+  from displaced slots and branched to the pthread handle. The trampoline now
+  calls pthread_exit(result), matching Bionic's __pthread_start, after tid
+  bookkeeping. Normal callbacks, join results and TLS destruction still work.
+- Image names borrowed from Mach-O wrapper literals became dangling when dyld
+  unloaded a wrapper while the guest image remained registered. Image now owns
+  its name for both blob and path loads. Guarding the caller's name storage after
+  loading deterministically reproduces the old crash and passes with the fix.
+- Linux FIOCLEX/FIONCLEX requests now map to the host close-on-exec operations,
+  including the ARM32 entry point and their no-argument semantics. Agora failed
+  engine creation immediately after the unsupported FIOCLEX request; the rebuilt
+  app initializes Agora, joins a live channel, and reports decoded audio/video.
+- Branch lookup caches misses until a new guard/landing is published and caches
+  host-return records with live/range validation. This avoids scanning thousands
+  of executable pages on every call into libc. A 9,000-record fixture checks miss
+  invalidation and collisions; 20,000 repeated host lookups fell from about
+  302 ms to 0.12 ms in the local benchmark (not an app frame-rate measurement).
+
+The thread-exit behavior follows
+[Bionic pthread_create.cpp](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/bionic/pthread_create.cpp).
+All four new native fixtures are included in debug/shadow_checkpoint_gate.sh.
+Live video and controls were visually observed after engine initialization;
+continuous playback, sound and reconnect behavior still need verification.
+No app checks, account decisions, or secure-window behavior are modified.
+
 ## Login dialog visibility
 
 The "Use Phone / Email" button started LoginActivity, but the previous sign-in

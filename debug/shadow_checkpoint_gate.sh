@@ -13,7 +13,7 @@ export MACAPK_JIT_FAULT_WX=1 MACAPK_DYNAMIC_SVC_BRK=1 MACAPK_DYNAMIC_SVC_SHADOW=
 python3 debug/make_linked_shadow_fixture.py "$out/liblinked.so"
 python3 debug/make_large_shadow_fixture.py "$out/liblarge-shadow.so"
 python3 debug/make_shadow_register_probe.py "$out/ShadowRegisterProbe.S"
-for test in A64ShadowPageTest TlsShadowTest DynamicShadowTest LinkedShadowTest ProcProcessRootTest ShadowRegistersTest ShadowRegistryGrowthTest SyscallGuardPublicationTest; do
+for test in A64ShadowPageTest TlsShadowTest DynamicShadowTest LinkedShadowTest ProcProcessRootTest ShadowRegistersTest ShadowRegistryGrowthTest SyscallGuardPublicationTest PthreadStartExitTest NativeImageNameLifetimeTest IoctlCloseOnExecTest ShadowBranchLookupTest; do
     if [[ "$test" == ShadowRegistersTest ]]; then
         clang++ -std=c++20 -Wl,-rpath,"$repo/thirdparty/angle-prebuilt/lib" "debug/$test.cpp" "$out/ShadowRegisterProbe.S" -o "$out/$test"
     else
@@ -22,7 +22,7 @@ for test in A64ShadowPageTest TlsShadowTest DynamicShadowTest LinkedShadowTest P
     codesign --force --sign - --entitlements runtime/scripts/jit-entitlements.plist "$out/$test"
     case "$test" in
         A64ShadowPageTest|SyscallGuardPublicationTest) "$out/$test" ;;
-        LinkedShadowTest) "$out/$test" "$shim" "$out/liblinked.so" ;;
+        LinkedShadowTest|NativeImageNameLifetimeTest) "$out/$test" "$shim" "$out/liblinked.so" ;;
         ShadowRegistryGrowthTest) "$out/$test" "$shim" "$out/liblarge-shadow.so" ;;
         TlsShadowTest) FAR_SHADOW=1 "$out/$test" "$shim" ;;
         *) "$out/$test" "$shim" ;;
