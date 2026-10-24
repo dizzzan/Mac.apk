@@ -1061,6 +1061,13 @@ public class Resources {
      *  Without this, no repos exist at startup and
      *  RepoUpdateManager.updateRepos has nothing to fetch. */
     public String[] getStringArray(int id) {
+        return macapkStringArray(id);
+    }
+    // AOSP Resources.getTextArray and getStringArray each read AssetManager;
+    // neither calls the other virtual method. Resource wrappers may implement
+    // getStringArray in terms of getTextArray and delegate the latter to super.
+    // Keep the shared lookup private so that valid wrapper shape cannot recurse.
+    private String[] macapkStringArray(int id) {
         if (macapkResourceIndex != null) {
             try {
                 java.lang.reflect.Method m = macapkResourceIndex.getClass()
@@ -1091,7 +1098,7 @@ public class Resources {
     /** AOSP `Resources.getTextArray(int)`. Same data as getStringArray
      *  but typed as CharSequence[]. */
     public CharSequence[] getTextArray(int id) {
-        return getStringArray(id);
+        return macapkStringArray(id);
     }
     // ---- DrawableCache (efficiency pass) ----
     //
