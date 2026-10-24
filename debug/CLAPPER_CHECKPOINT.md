@@ -40,7 +40,7 @@ recording dimensions during that view's draw, matching AOSP View's per-view
 RenderNode.beginRecording(width, height). Nested scopes and exceptions restore
 the parent dimensions; ordinary bitmap canvases retain their original behavior.
 The owner confirmed that the digits now appear and email sign-in completes.
-The debug app was left running in its authenticated session.
+The next run exposed the post-login native-loader crash described below.
 
 The regression fails on the previous implementation and passes all 13 checks
 with the fix, including touch routing, hide/show lifecycle counts, dismiss while
@@ -65,6 +65,31 @@ Additional regressions (compile/run with the same classpath above):
 - `debug/ViewRecordingCanvasSizeTest.java`: six checks for child/parent canvas
   dimensions, actual center-mark pixels within the child's bounds, exception
   restoration, and unmodified ordinary bitmap drawing.
+
+## Post-login loader capacity
+
+After authentication, Clapper loads liblight-sdk.so. The execution-copy registry
+already held 3,982 pages; publishing this library hit its process-wide 4,096-entry
+limit and threw `linked shadow publication failed`, terminating the app.
+
+Guard records now live in append-only blocks. Growing the registry does not move
+published records or cached pointers. Readers, including signal handlers, use
+atomic publication without locks or allocation. Inactive records remain valid
+for existing readers. The loader's separate fixed-size pending-protection list
+is now an image-owned vector, so a single large image also exceeds 4,096 pages.
+
+A generated 4,101-page ELF reproduces the old failure and passes with the fix:
+first/last-page execution, original bytes and read-only protections, duplicate
+registration, and lookup-cache collisions. Concurrent publication of 8,193
+records passes normally and under ThreadSanitizer. The native checkpoint gate
+passes all eight fixtures with the new registry.
+
+The rebuilt Clapper app restored the saved sign-in, loaded more than 5,900 guard
+records, completed all 1,571 light-sdk initializers, and opened the authenticated
+profile and video feed without the previous process termination. An unrelated
+background SDK initialization still reports a missing
+`com.tencent.xmagic.util.SSLHelperAndroid`; recording/effects are not validated
+by this checkpoint.
 
 ## Playback failure and fix
 
@@ -126,7 +151,8 @@ signed test bundles are not included in this repository checkpoint.
 - `bash debug/shadow_checkpoint_gate.sh`: 18 relocation checks, distant
   execution copies, original LR, cross-page branches, host returns, thread-local
   TLS, x18, reprotection, generated syscalls, errno, self-modification, unmap/reuse,
-  process-root traversal, and register/FP/SIMD preservation. Uses real arm64 code.
+  process-root traversal, register/FP/SIMD preservation, a 4,101-page ELF, and
+  concurrent guard publication. Uses real arm64 code.
 - `JAVA_HOME=/path/to/jdk python3 debug/native_texture_window_gate.py`: real
   embedded JVM with `-Xcheck:jni` and ANGLE; two independent surfaces, color-pixel
   checks, recreation, reference ownership, and null/released Surface inputs.
@@ -138,9 +164,9 @@ signed test bundles are not included in this repository checkpoint.
 ## Remaining experimental scope
 
 Execution copies remain opt-in. Before upstream submission, improve concurrent
-code-rewrite/publication handling, capacity reclamation in the bounded 4096-entry
-guard registry, unload/address-reuse behavior, and unsupported instruction-page
-handling. The current linked reservation can use up to nine host pages per
+code-rewrite/publication handling, reclamation of inactive guard records,
+unload/address-reuse behavior, and unsupported instruction-page handling.
+The registry grows as needed; its published records remain allocated until exit. The current linked reservation can use up to nine host pages per
 original image page. Native TextureWindow buffer-geometry overrides and broader
 producer lifecycle/API parity still need coverage; the tested default geometry
 and EGL producer path work. These are reasons to retain a fork checkpoint and

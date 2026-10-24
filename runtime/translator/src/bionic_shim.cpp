@@ -30,6 +30,7 @@
 #include "native_window_pixels.h"
 #include "a64_dynamic_syscall.h"
 #include "fault_wx_pages.h"
+#include "syscall_guard_registry.h"
 #include "../../include/macapk/apk_exec_path.h"
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
@@ -2589,45 +2590,34 @@ static void macapk_pairip_crashdump(int sig, siginfo_t* info, void* ucontext);
 // pairip's is the motivating case but not the only one -- passes), and this handler services
 // the resulting exec-fault: the wrapper via the syscall router, a neighbour via a relocated
 // executable copy of the page. Several images (or several wrappers) can each register a page,
-// so entries live in a small fixed array scanned per fault -- a SINGLE global slot would
-// misroute a second image's faults into the first image's shadow. 2026-09-16: generalised
-// from the pairip-only single-slot form to the default-for-all-apps table.
-struct MacapkSyscallGuard { uintptr_t lo, hi, shadow, wrapper; bool dynamic; };
-static MacapkSyscallGuard g_sc_guards[4096];
-static std::atomic<bool> g_sc_guard_live[4096];
-static std::atomic<uintptr_t> g_sc_guard_landing[4096]{};
-static std::atomic<uintptr_t> g_sc_guard_host_return[4096]{};
-static std::atomic<int>   g_sc_guard_n{0};
+// so records live in append-only blocks that remain stable during signal-handler
+// reads and can grow when later-loaded libraries need more execution pages.
+using MacapkSyscallGuard = macapk::SyscallGuard;
+static macapk::SyscallGuardRegistry g_sc_guards;
 extern "C" void __macapk_set_shadow_landing(uintptr_t original, uintptr_t landing, uintptr_t host_return) {
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    for (int i=0; i<n; ++i) if (g_sc_guards[i].lo == original && g_sc_guard_live[i].load()) {
-        g_sc_guard_host_return[i].store(host_return,std::memory_order_release);
-        g_sc_guard_landing[i].store(landing, std::memory_order_release); return;
+    for (auto& g : g_sc_guards) if (g.lo == original && g.live.load()) {
+        g.host_return.store(host_return,std::memory_order_release);
+        g.landing.store(landing, std::memory_order_release); return;
     }
 }
 extern "C" uintptr_t __macapk_shadow_code_for(uintptr_t target) {
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    for (int i=0; i<n; ++i) {
-        const auto& g=g_sc_guards[i];
-        if (target>=g.lo && target<g.hi && g_sc_guard_live[i].load(std::memory_order_acquire) &&
-            g_sc_guard_landing[i].load(std::memory_order_acquire)) return g.shadow+target-g.lo;
+    for (const auto& g : g_sc_guards) {
+        if (target>=g.lo && target<g.hi && g.live.load(std::memory_order_acquire) &&
+            g.landing.load(std::memory_order_acquire)) return g.shadow+target-g.lo;
     }
     return target;
 }
 extern "C" uintptr_t __macapk_shadow_landing_for(uintptr_t target) {
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    static std::atomic<unsigned> cache[4096]{};
+    static std::atomic<const MacapkSyscallGuard*> cache[4096]{};
     auto& c = cache[(target >> 14) & 4095];
-    unsigned index = c.load(std::memory_order_relaxed);
-    auto match = [&](unsigned i) -> uintptr_t {
-        if (i >= unsigned(n) || !g_sc_guard_live[i].load(std::memory_order_acquire)) return 0;
-        const auto& g = g_sc_guards[i];
-        if (target < g.lo || target >= g.hi || (target & 3)) return 0;
-        uintptr_t landing = g_sc_guard_landing[i].load(std::memory_order_acquire);
-        return landing ? landing + (target - g.lo) * 2 : 0;
+    auto match = [&](const MacapkSyscallGuard* g) -> uintptr_t {
+        if (!g || !g->live.load(std::memory_order_acquire)) return 0;
+        if (target < g->lo || target >= g->hi || (target & 3)) return 0;
+        uintptr_t landing = g->landing.load(std::memory_order_acquire);
+        return landing ? landing + (target - g->lo) * 2 : 0;
     };
-    if (index) if (uintptr_t p = match(index - 1)) return p;
-    for (int i=0; i<n; ++i) if (uintptr_t p = match(i)) { c.store(i+1); return p; }
+    if (uintptr_t p = match(c.load(std::memory_order_acquire))) return p;
+    for (const auto& g : g_sc_guards) if (uintptr_t p = match(&g)) { c.store(&g,std::memory_order_release); return p; }
     return 0;
 }
 extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* saved_lr) {
@@ -2646,11 +2636,9 @@ extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* 
     }
     if (!e.host) return 0;
     uintptr_t lr=*saved_lr;
-    int n=g_sc_guard_n.load(std::memory_order_acquire);
-    for (int i=0;i<n;++i) {
-        const auto& g=g_sc_guards[i];
-        if (lr>=g.lo && lr<g.hi && !(lr&3) && g_sc_guard_live[i].load()) {
-            uintptr_t landing=g_sc_guard_host_return[i].load(std::memory_order_acquire);
+    for (const auto& g : g_sc_guards) {
+        if (lr>=g.lo && lr<g.hi && !(lr&3) && g.live.load()) {
+            uintptr_t landing=g.host_return.load(std::memory_order_acquire);
             if (landing) *saved_lr=landing+(lr-g.lo)*4;
             break;
         }
@@ -2659,19 +2647,16 @@ extern "C" uintptr_t __macapk_shadow_branch_target(uintptr_t target, uintptr_t* 
 }
 static void* macapk_original_return_address(void* address) {
     uintptr_t pc=reinterpret_cast<uintptr_t>(address);
-    int n=g_sc_guard_n.load(std::memory_order_acquire);
-    for(int i=0;i<n;++i) {
-        uintptr_t base=g_sc_guard_host_return[i].load(std::memory_order_acquire);
-        if (base && pc>=base && pc-base<(g_sc_guards[i].hi-g_sc_guards[i].lo)*4 &&
-            g_sc_guard_live[i].load()) return reinterpret_cast<void*>(g_sc_guards[i].lo+(pc-base)/4);
+    for (const auto& g : g_sc_guards) {
+        uintptr_t base=g.host_return.load(std::memory_order_acquire);
+        if (base && pc>=base && pc-base<(g.hi-g.lo)*4 &&
+            g.live.load()) return reinterpret_cast<void*>(g.lo+(pc-base)/4);
     }
     return address;
 }
 static bool macapk_pc_in_syscall_shadow(uintptr_t pc) {
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    for (int i = 0; i < n; ++i) {
-        const auto& g = g_sc_guards[i];
-        if (g_sc_guard_live[i].load(std::memory_order_acquire) &&
+    for (auto& g : g_sc_guards) {
+        if (g.live.load(std::memory_order_acquire) &&
             pc >= g.shadow && pc - g.shadow < g.hi - g.lo) return true;
     }
     return false;
@@ -2681,18 +2666,14 @@ static bool macapk_register_syscall_guard(uintptr_t page_lo, uintptr_t page_hi,
                                           uintptr_t shadow_base, uintptr_t wrapper_va, bool dynamic) {
     static std::mutex registration_mutex;
     std::lock_guard<std::mutex> lock(registration_mutex);
-    int n = g_sc_guard_n.load(std::memory_order_relaxed);
-    for (int i = 0; i < n; ++i)
-        if (g_sc_guard_live[i].load(std::memory_order_acquire) && g_sc_guards[i].lo == page_lo) return false;
-    if (n >= (int)(sizeof(g_sc_guards) / sizeof(g_sc_guards[0]))) {
-        std::fprintf(stderr, "[guard] table full (%d entries) -- page %#lx NOT guarded\n",
-                     n, (unsigned long)page_lo); std::fflush(stderr); return false;
+    for (const auto& g : g_sc_guards)
+        if (g.live.load(std::memory_order_acquire) && g.lo == page_lo) return false;
+    if (!g_sc_guards.append(page_lo, page_hi, shadow_base, wrapper_va, dynamic)) {
+        std::fprintf(stderr, "[guard] allocation failed -- page %#lx NOT guarded\n", (unsigned long)page_lo);
+        std::fflush(stderr); return false;
     }
-    g_sc_guards[n] = { page_lo, page_hi, shadow_base, wrapper_va, dynamic };
-    g_sc_guard_live[n].store(true, std::memory_order_release);
-    g_sc_guard_n.store(n + 1, std::memory_order_release);   // publish after the slot is filled
-    std::fprintf(stderr, "[guard] handler armed #%d: page [%#lx,%#lx) shadow %#lx wrapper %#lx\n",
-                 n, (unsigned long)page_lo, (unsigned long)page_hi,
+    std::fprintf(stderr, "[guard] handler armed #%zu: page [%#lx,%#lx) shadow %#lx wrapper %#lx\n",
+                 g_sc_guards.size() - 1, (unsigned long)page_lo, (unsigned long)page_hi,
                  (unsigned long)shadow_base, (unsigned long)wrapper_va);
     std::fflush(stderr);
     return true;
@@ -2703,10 +2684,8 @@ extern "C" bool __macapk_try_set_syscall_guard_page(uintptr_t page_lo, uintptr_t
 }
 static void macapk_remove_syscall_guards(uintptr_t lo, size_t len) {
     if (lo + len < lo) return;
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    for (int i = 0; i < n; ++i) {
-        const auto& g = g_sc_guards[i];
-        if (g.lo >= lo + len || g.hi <= lo || !g_sc_guard_live[i].exchange(false)) continue;
+    for (auto& g : g_sc_guards) {
+        if (g.lo >= lo + len || g.hi <= lo || !g.live.exchange(false)) continue;
         if (g.dynamic) mach_vm_deallocate(mach_task_self(), g.shadow, 0xc000);
     }
 }
@@ -2717,21 +2696,16 @@ extern "C" void __macapk_set_syscall_guard_page(uintptr_t page_lo, uintptr_t pag
 static bool macapk_syscall_guard_fault(ucontext_t* uc, uintptr_t pc, bool static_only = false) {
     unsigned ec = uc->uc_mcontext->__es.__esr >> 26;
     if (ec != 0x20 && ec != 0x21) return false;
-    int n = g_sc_guard_n.load(std::memory_order_acquire);
-    if (!n) return false;                                    // guard not armed: cheap exit
-    // Immutable guard records permit a lock-free direct-mapped lookup cache.
-    // A collision or invalidated dynamic mapping falls back to the full scan.
-    static std::atomic<unsigned> cache[4096]{};
+    // Cached pointers stay valid across registry growth. Inactive records and
+    // hash collisions fall back to a scan of the published blocks.
+    static std::atomic<const MacapkSyscallGuard*> cache[4096]{};
     auto& entry = cache[(pc >> 14) & 4095];
-    unsigned cached = entry.load(std::memory_order_relaxed);
-    const MacapkSyscallGuard* g = nullptr;
-    if (cached && cached <= unsigned(n) && g_sc_guard_live[cached - 1].load(std::memory_order_acquire)) {
-        const auto& candidate = g_sc_guards[cached - 1];
-        if (pc >= candidate.lo && pc < candidate.hi) g = &candidate;
-    }
-    for (int i = 0; !g && i < n; ++i)
-        if (g_sc_guard_live[i].load(std::memory_order_acquire) &&
-            pc >= g_sc_guards[i].lo && pc < g_sc_guards[i].hi) { g = &g_sc_guards[i]; entry.store(i + 1, std::memory_order_relaxed); break; }
+    const MacapkSyscallGuard* g = entry.load(std::memory_order_acquire);
+    if (g && (!g->live.load(std::memory_order_acquire) || pc < g->lo || pc >= g->hi)) g = nullptr;
+    if (!g) for (const auto& candidate : g_sc_guards)
+        if (candidate.live.load(std::memory_order_acquire) && pc >= candidate.lo && pc < candidate.hi) {
+            g = &candidate; entry.store(g, std::memory_order_release); break;
+        }
     if (!g || (static_only && g->dynamic)) return false;
     static const bool preserve_x18 = std::getenv("MACAPK_TPIDR_SHADOW") != nullptr;
     if (preserve_x18) macapk_enable_x18_preservation();
@@ -14625,10 +14599,8 @@ static void macapk_svc_brk_sigtrap(int sig, siginfo_t* info, void* ucontext) {
             uint32_t at = *reinterpret_cast<const uint32_t*>(pc);
             unsigned tag = (at >> 5) & 0xffffu;
             if ((at & 0xffe0001fu) == 0xd4200000u && tag >= 0x4da0 && tag <= 0x4da2) {
-                int n = g_sc_guard_n.load(std::memory_order_acquire);
-                for (int i = 0; i < n; ++i) {
-                    const auto& g = g_sc_guards[i];
-                    if (!g_sc_guard_live[i].load(std::memory_order_acquire) ||
+                for (const auto& g : g_sc_guards) {
+                    if (!g.live.load(std::memory_order_acquire) ||
                         pc < g.shadow || pc - g.shadow >= 0xc000) continue;
                     uintptr_t offset = pc - g.shadow, target = 0;
                     if (tag == 0x4da0 && offset < g.hi - g.lo) {
@@ -58156,10 +58128,8 @@ static void macapk_prepare_dynamic_syscalls(void* addr, size_t len, int prot) {
             || (info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE))
                 != (VM_PROT_READ | VM_PROT_WRITE)) return;
     if (std::getenv("MACAPK_DYNAMIC_SVC_SHADOW") && !(start & 0x3fff) && len <= 0x4000) {
-        int n = g_sc_guard_n.load(std::memory_order_acquire);
-        for (int i = 0; i < n; ++i) {
-            const auto& g = g_sc_guards[i];
-            if (g_sc_guard_live[i].load(std::memory_order_acquire) && g.lo == start) {
+        for (const auto& g : g_sc_guards) {
+            if (g.live.load(std::memory_order_acquire) && g.lo == start) {
                 if (g.dynamic) __macapk_refresh_execution_shadow(start, g.shadow);
                 return;
             }
@@ -58243,10 +58213,8 @@ extern "C" int __macapk_arm64_mprotect(void* addr, size_t len, int prot) {
         g_fault_wx_pages.remove(uintptr_t(addr), len);
     if (rc == 0 && close_window && std::getenv("MACAPK_TPIDR_SHADOW")) {
         uintptr_t lo = uintptr_t(addr), hi = lo + len;
-        int n = g_sc_guard_n.load(std::memory_order_acquire);
-        for (int i = 0; i < n; ++i) {
-            const auto& g = g_sc_guards[i];
-            if (!g_sc_guard_live[i].load(std::memory_order_acquire) || g.wrapper || g.lo >= hi || g.hi <= lo) continue;
+        for (const auto& g : g_sc_guards) {
+            if (!g.live.load(std::memory_order_acquire) || g.wrapper || g.lo >= hi || g.hi <= lo) continue;
             if (::mprotect(reinterpret_cast<void*>(g.lo), g.hi - g.lo, prot & ~PROT_EXEC) ||
                 !__macapk_refresh_execution_shadow(g.lo, g.shadow)) {
                 rc = -1;

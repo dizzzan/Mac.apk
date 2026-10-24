@@ -82,13 +82,6 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <set>
-// syscall guard-page: the pages whose X we strip AFTER apply_segment_protections (deferred, so
-// the protection pass does not re-flip them R-X). File scope so both macapk_setup_syscall_guard_page
-// and the loader's post-protections step see them. An array because one image can hold more than
-// one wrapper page. See docs/pairip-text-selfhash-root-cause.
-static uintptr_t g_pending_guard_strip_lo[4096] = {0};
-static size_t    g_pending_guard_strip_sz[4096] = {0};
-static int       g_pending_guard_strip_n = 0;
 #include <unordered_set>
 #include <vector>
 
@@ -663,6 +656,8 @@ private:
     size_t map_len_   = 0;
     uintptr_t svc_shadow_reserve_ = 0;
     size_t svc_shadow_reserve_size_ = 0, svc_shadow_reserve_used_ = 0;
+    // Strip execute permission after segment protections, for this image only.
+    std::vector<std::pair<uintptr_t, size_t>> pending_guard_strips_;
 
 public:
     // Range accessors for callers (the SEGV handler) that need to
@@ -5592,17 +5587,17 @@ bool Image::load_common() {
     // re-flipped to R-X. Bytes stay pristine (any .text self-hash passes); exec-faults route
     // through macapk_syscall_guard_fault. No-op unless macapk_setup_syscall_guard_page armed one
     // (default ON; MACAPK_GUARD_SYSCALL=0 forces the in-place .text patch instead).
-    for (int i = 0; i < g_pending_guard_strip_n; ++i) {
-        if (mprotect(reinterpret_cast<void*>(g_pending_guard_strip_lo[i]),
-                     g_pending_guard_strip_sz[i], PROT_READ) != 0)
+    for (const auto& [page, size] : pending_guard_strips_) {
+        if (mprotect(reinterpret_cast<void*>(page),
+                     size, PROT_READ) != 0)
             std::fprintf(stderr, "[guard] deferred strip-X FAILED page %#lx errno=%d\n",
-                         (unsigned long)g_pending_guard_strip_lo[i], errno);
+                         (unsigned long)page, errno);
         else
             std::fprintf(stderr, "[guard] deferred strip-X applied: page %#lx R-- (guard live)\n",
-                         (unsigned long)g_pending_guard_strip_lo[i]);
+                         (unsigned long)page);
     }
     std::fflush(stderr);
-    g_pending_guard_strip_n = 0;
+    pending_guard_strips_.clear();
     std::fprintf(stderr,
         "[arm64-native] %s: protections applied\n", dbg_name_);
 
@@ -11373,7 +11368,8 @@ size_t Image::apply_raw_syscall_wrapper_redirect() {
             // (no free page within +/-1MB, guard table full). Force the old in-place patch with
             // MACAPK_GUARD_SYSCALL=0.
             {
-                extern bool macapk_setup_syscall_guard_page(uintptr_t, uintptr_t, const char*);
+                extern bool macapk_setup_syscall_guard_page(uintptr_t, uintptr_t, const char*,
+                    std::vector<std::pair<uintptr_t, size_t>>&);
                 static const bool s_guard = []{
                     const char* e = std::getenv("MACAPK_GUARD_SYSCALL");
                     return !(e && e[0] == '0');
@@ -11381,7 +11377,7 @@ size_t Image::apply_raw_syscall_wrapper_redirect() {
                 if (s_guard) {
                     if (macapk_setup_syscall_guard_page(
                             reinterpret_cast<uintptr_t>(p),
-                            reinterpret_cast<uintptr_t>(base_), dbg_name_)) {
+                            reinterpret_cast<uintptr_t>(base_), dbg_name_, pending_guard_strips_)) {
                         ++patched; p += 3; continue;   // handled; .text UNCHANGED
                     }
                     // guard setup failed -> fall through to the in-place .text patch
@@ -11520,7 +11516,8 @@ static void macapk_guard_reencode(uint32_t* w, uint64_t oa, uint64_t sa) {
 // original. Returns true on success (or if the page is already guarded). A blind per-word
 // re-encode keeps literal pools harmless, so no disassembler is needed.
 bool macapk_setup_syscall_guard_page(uintptr_t wrapper_va, uintptr_t base,
-                                     const char* dbg_name) {
+                                     const char* dbg_name,
+                                     std::vector<std::pair<uintptr_t, size_t>>& pending_guard_strips) {
     const uintptr_t page_lo = wrapper_va & ~(uintptr_t)0x3fff;    // 16 KB page
     const size_t    pgsz    = 0x4000;
     const uintptr_t page_hi = page_lo + pgsz;
@@ -11572,11 +11569,7 @@ bool macapk_setup_syscall_guard_page(uintptr_t wrapper_va, uintptr_t base,
         return false;
     }
     // DEFER the strip-X (apply_segment_protections would otherwise re-flip this page R-X).
-    if (g_pending_guard_strip_n < (int)(sizeof(g_pending_guard_strip_lo)/sizeof(uintptr_t))) {
-        g_pending_guard_strip_lo[g_pending_guard_strip_n] = page_lo;
-        g_pending_guard_strip_sz[g_pending_guard_strip_n] = pgsz;
-        ++g_pending_guard_strip_n;
-    }
+    pending_guard_strips.emplace_back(page_lo, pgsz);
     s_guarded_pages.insert(page_lo);
     __macapk_set_syscall_guard_page(page_lo, page_hi, (uintptr_t)shadow, wrapper_va);
     std::fprintf(stderr,
@@ -11931,10 +11924,7 @@ size_t Image::apply_svc_shadow_pages() {
                 !__macapk_try_set_syscall_guard_page(page,page+page_size,shadow,0))
                 throw std::runtime_error("linked shadow publication failed");
             __macapk_set_shadow_landing(page,shadow+3*page_size,host_returns ? shadow+5*page_size : 0);
-            if (g_pending_guard_strip_n >= int(std::size(g_pending_guard_strip_lo)))
-                throw std::runtime_error("linked shadow protection registry full");
-            g_pending_guard_strip_lo[g_pending_guard_strip_n]=page;
-            g_pending_guard_strip_sz[g_pending_guard_strip_n++]=page_size;
+            pending_guard_strips_.emplace_back(page, page_size);
             count+=pages[page].size();
         }
         svc_shadow_reserve_used_=pages.size()*stride;
@@ -11943,7 +11933,6 @@ size_t Image::apply_svc_shadow_pages() {
     }
     size_t count = 0;
     for (auto& [page, sites] : pages) {
-        if (g_pending_guard_strip_n >= int(std::size(g_pending_guard_strip_lo))) break;
         std::span<const uint32_t> original(reinterpret_cast<const uint32_t*>(page), page_size / 4);
         std::vector<uint32_t> relocated;
         mach_vm_address_t shadow = 0;
@@ -11999,8 +11988,7 @@ size_t Image::apply_svc_shadow_pages() {
         if (reserved) svc_shadow_reserve_used_ += allocation_size;
         for (uint32_t* site : sites) if (*site == brk) *site = svc;
         sys_icache_invalidate(reinterpret_cast<void*>(page), page_size);
-        g_pending_guard_strip_lo[g_pending_guard_strip_n] = page;
-        g_pending_guard_strip_sz[g_pending_guard_strip_n++] = page_size;
+        pending_guard_strips_.emplace_back(page, page_size);
         count += sites.size();
         std::fprintf(stderr, "[svc-shadow] %s: preserved %zu SVC word(s) on page +%#llx; execution copy=%#llx\n",
                      dbg_name_, sites.size(), (unsigned long long)(page - reinterpret_cast<uintptr_t>(base_)),
