@@ -44,7 +44,9 @@
 //     pulls the newest frame as RGBA (converted in native code, where the
 //     CVPixelBuffer strides are authoritative) and uploads it into the
 //     attached texture name via glTexImage2D on the CALLER's current context.
-//     The upload targets GL_TEXTURE_2D because ANGLE's Metal backend does not
+//     On backends supporting OES external images, an EGLImage carries the
+//     upload into GL_TEXTURE_EXTERNAL_OES, as in Android's GLConsumer. The
+//     legacy upload targets GL_TEXTURE_2D because ANGLE's Metal backend does not
 //     expose GL_OES_EGL_image_external (DisplayMtl.mm sets
 //     EGLImageExternalOES = false), so a consumer's samplerExternalOES shader
 //     still needs the GLES-bridge translation to sampler2D before it can
@@ -152,6 +154,15 @@ public class SurfaceTexture {
     private int mCamHeight;
 
     // ---- Decoded-video frame source (guarded by mLock) --------------------
+    // Decoder buffers use top-down rows. GLConsumerUtils::computeTransformMatrix
+    // adds this vertical flip to map GL's bottom-left origin to buffer memory.
+    // The software Bitmap consumer reads the top-down pixels directly.
+    private static final float[] DECODED_TEXTURE_TRANSFORM = {
+        1f, 0f, 0f, 0f,
+        0f, -1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 1f, 0f, 1f,
+    };
     // An ALTERNATIVE producer shape to the camera session above, for a
     // MediaCodec video decoder targeting this stream's Surface (see
     // TextureView.getSurface(), macapkRegisterVideoTarget below, and
@@ -168,8 +179,8 @@ public class SurfaceTexture {
     private boolean mHasVideoFrame;
     // The pushed frame's owner-supplied hooks (macapkQueueProducerFrame): who
     // gets the int[] back once it is consumed or superseded, and the frame's
-    // own texture transform. Both null for a decoded-video frame, which keeps
-    // that path byte-for-byte what it was before the GL producer existed.
+    // own texture transform. Decoded video supplies its top-down buffer
+    // transform and no recycler.
     private java.util.function.Consumer<int[]> mVideoFrameRecycler;
     private float[] mVideoFrameTransform;
     // True when the pushed frame came from a PREMULTIPLIED producer buffer (a
@@ -193,6 +204,13 @@ public class SurfaceTexture {
     private int mGlParamsSetForTex;                     // 0 = not yet
     private boolean mGlUploadCheckedOnce;
     private volatile int mLatchGeneration;              // bumps per fresh latch
+
+    // GLConsumer binds an EGLImage to the external texture target. A texture
+    // already bound as EXTERNAL_OES cannot subsequently be bound as TEXTURE_2D.
+    // Return false only when the current backend lacks external-image support,
+    // retaining the existing Metal/software-consumer behavior there.
+    private static native boolean nativeUploadExternalFrame(int texture, int width,
+            int height, java.nio.ByteBuffer rgba);
 
     /**
      * Construct a new SurfaceTexture to stream images to a given OpenGL texture.
@@ -438,6 +456,8 @@ public class SurfaceTexture {
                 // (macapkLatchBitmap) does not use one either.
                 return;
             }
+            mLatchRgba.position(0);
+            if (nativeUploadExternalFrame(tex, w, h, mLatchRgba)) return;
             // Save and restore the caller's 2D binding on the active unit; a
             // consumer between draw calls must not find its state moved.
             int[] saved = new int[1];
@@ -553,6 +573,7 @@ public class SurfaceTexture {
         try {
             android.opengl.EGLContext ctx = android.opengl.EGL14.eglGetCurrentContext();
             if (ctx == null || ctx.getNativeHandle() == 0) return;
+            if (nativeUploadExternalFrame(tex, w, h, mLatchRgba)) return;
             int[] saved = new int[1];
             android.opengl.GLES20.glGetIntegerv(GL_TEXTURE_BINDING_2D, saved, 0);
             android.opengl.GLES20.glBindTexture(
@@ -939,16 +960,18 @@ public class SurfaceTexture {
      *  macapkQueueFrame (the metadata-only, pull-the-pixels-later shape the
      *  camera producer uses), the pixels are already in hand here, so they
      *  are stored directly rather than triggering a later pull. Now a thin
-     *  delegate of the per-instance macapkQueueProducerFrame below, with no
-     *  transform and no recycler, which is exactly what it always did. */
+     *  delegate of the per-instance macapkQueueProducerFrame below, with the
+     *  top-down buffer transform and no recycler. */
     void macapkQueueDecodedFrame(int[] argb, int width, int height, int strideInPixels) {
-        macapkQueueProducerFrame(argb, width, height, strideInPixels, null, null, false);
+        macapkQueueProducerFrame(argb, width, height, strideInPixels,
+                                DECODED_TEXTURE_TRANSFORM, null, false);
     }
 
     /** MediaCodec producer: the buffer's timestamp belongs to this stream. */
     public void macapkQueueDecodedFrame(int[] argb, int width, int height,
                                         int strideInPixels, long timestampNanos) {
-        queueProducerFrame(argb, width, height, strideInPixels, null, null, false, timestampNanos);
+        queueProducerFrame(argb, width, height, strideInPixels,
+                           DECODED_TEXTURE_TRANSFORM, null, false, timestampNanos);
     }
 
     // ---- Per-instance pixel producer (EGL window surfaces) ----------------
@@ -1007,7 +1030,7 @@ public class SurfaceTexture {
      *     with it.
      * @param transform the frame's 4x4 column-major texture transform, reported
      *     by getTransformMatrix once updateTexImage latches this frame, or null
-     *     to leave the current one (the decoded-video behaviour).
+     *     to leave the current one.
      * @param recycler receives {@code argb} back once the frame is consumed by
      *     either latch or superseded by a newer frame, so a producer can reuse
      *     its buffers (at most three in flight: filling, queued, latching) the
@@ -1065,10 +1088,6 @@ public class SurfaceTexture {
         if (h != null) h.sendEmptyMessage(0);
     }
 
-    /** Consume the pushed frame's owner hooks under mLock: apply its own
-     *  transform (a GL producer's; decoded video has none, so the current
-     *  matrix is untouched exactly as before) and hand back its recycler for
-     *  the caller to run once the pixels are copied. */
     /** One ARGB_8888 int from straight to premultiplied alpha, rounded as
      *  Skia's SkMulDiv255Round (the GLUtils upload uses the same rounding). */
     private static int premultiplyArgb(int p) {
@@ -1084,6 +1103,8 @@ public class SurfaceTexture {
         return (prod + (prod >> 8)) >> 8;
     }
 
+    /** Apply the acquired frame's transform and transfer its recycler to the
+     *  consumer, which runs it after copying the pixels. Caller holds mLock. */
     private java.util.function.Consumer<int[]> takeFrameHooksLocked() {
         if (mVideoFrameTransform != null) {
             System.arraycopy(mVideoFrameTransform, 0, mCurrentTransformMatrix, 0, 16);
@@ -1124,12 +1145,9 @@ public class SurfaceTexture {
                 // consumer shapes... mirroring the two consumers real Android
                 // has": this is a third PRODUCER shape feeding the same two
                 // consumers (this method, and updateTexImage's GL upload).
-                // The transform matrix is deliberately left untouched
-                // (identity, unless an app or earlier producer already set
-                // one): the decoded frame arrives already right-way-up and
-                // uncropped -- see cocoa_bridge.mm's extraction, a raw memcpy
-                // off the same CVPixelBuffer memory the proven SurfaceView
-                // present path reads, with no GL sampling step to correct for.
+                // Metadata keeps the frame's GL sampling transform, but this
+                // Bitmap consumer copies top-down pixels directly and needs
+                // no GL-origin correction.
                 vArgb = mVideoFrameArgb; vW = mVideoFrameW; vH = mVideoFrameH;
                 vStride = mVideoFrameStride;
                 mCurrentTimestamp = mPendingTimestamp;

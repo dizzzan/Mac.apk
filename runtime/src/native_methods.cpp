@@ -57,6 +57,8 @@ int  CocoaWindowOverrideOrientation(const std::string& component, int record_ori
 
 namespace {
 
+#include "surface_texture_gl.inc"
+
 // ---------- com.macapk.loader.NativeLog ----------
 //
 // Bare-bones log sink. Every "android.util.Log" call inside the framework
@@ -4496,6 +4498,8 @@ void RegisterAllNativeMethods(JNIEnv* env) {
          sizeof(kNativeGlesMethods)  / sizeof(kNativeGlesMethods[0]));
     Bind(env, "android/opengl/GLES20",          kGles20Methods,
          sizeof(kGles20Methods)      / sizeof(kGles20Methods[0]));
+    Bind(env, "android/graphics/SurfaceTexture", kSurfaceTextureGlMethods,
+         sizeof(kSurfaceTextureGlMethods) / sizeof(kSurfaceTextureGlMethods[0]));
     Bind(env, "android/opengl/GLUtils",         kGLUtilsMethods,
          sizeof(kGLUtilsMethods)     / sizeof(kGLUtilsMethods[0]));
     Bind(env, "android/opengl/GLES30",          kGl3GLES30Methods,

@@ -299,25 +299,60 @@ diagnosis. Comparison with the owner's working emulator and Clapper version is
 still needed. Private inspection agents, app bytecode, account data and logs
 remain outside this repository.
 
-### User-selected display identity / API 34 experiment (2026-10-24)
+### User-selected display identity / Android version experiment (2026-10-24)
 
-At the owner's request, the local Clapper launcher now selects the Galaxy A52
-labels (`samsung`, `samsung`, `SM-A525F`) and Android 14/API 34. The generic
-optional label variables are documented in [DEVICE_IDENTITY.md](DEVICE_IDENTITY.md).
-The shared execution profile does not select them, and the TikTok bundle/data
-were not changed. This does not suppress Clapper's warning handler or change
-hardware capability flags.
+The owner tested Galaxy A52 display labels (`samsung`, `samsung`, `SM-A525F`)
+with Android 14/API 34. The warning remained. The local launcher was restored
+to Android 16/API 36 with the requested phone labels retained. The optional
+label variables are documented in [DEVICE_IDENTITY.md](DEVICE_IDENTITY.md);
+the shared execution profile does not select them. TikTok's bundle and data
+remain unchanged.
 
-The Java build and 13 fresh-JVM identity/initialization runs pass. A read-only
-JNI probe in the running app confirmed identical Java/native model, manufacturer,
-brand, fingerprint and Android version. The feed, authenticated test profile and
-Live activity open. The cached legacy emulator result remains true; the initial
-new room had no active mask, which alone does not establish a warning fix.
-The owner's multi-stream check is pending.
+The Java build and 13 fresh-JVM identity/initialization runs pass. Read-only
+JNI inspection confirmed agreement between Java and native properties. Neither
+the API experiment nor the labels resolved the cached legacy emulator result.
+The owner then supplied working, warning, and black-with-audio live examples.
+All three occurred under the same API 36 profile. The black-video issue below
+was a rendering contract defect, rather than evidence of a version regression.
 
-The preceding API 36 session also ended after about 18 minutes in a native
-`liteav_video_decoder` SIGSEGV, with the same guest stack as an earlier SIGBUS.
-This is a remaining stability issue, not evidence of an API 34 improvement.
+### External video textures and orientation (2026-10-24)
+
+The working live example uses Agora. A second Agora room activates the app's
+environment mask. A Tencent/LiteAV example receives and hardware-decodes frames
+with that mask false, but samples a black external texture. SurfaceTexture's
+upload tried to bind an existing GL_TEXTURE_EXTERNAL_OES name as GL_TEXTURE_2D,
+which produces GL_INVALID_OPERATION on every frame. Its later upload modified
+the unrelated 2D binding instead of the decoder's external image.
+
+On backends with OES external-image support, the framework now uploads into
+private 2D storage, creates a preserved EGLImage, and binds its external sibling
+to the consumer texture. The temporary image/source handles are released after
+binding; the external sibling keeps its storage alive. The upload preserves
+2D bindings, pixel-unpack state, and the caller's GL error state. Backends without
+external-image support retain their existing path. Decoded top-down buffers now
+carry GLConsumer's vertical-flip sampling transform; direct Bitmap consumers
+continue to copy top-down rows without applying that GL transform.
+
+References: [AOSP SurfaceTexture](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/graphics/java/android/graphics/SurfaceTexture.java),
+[GLConsumer transform](https://android.googlesource.com/platform/frameworks/native/+/refs/heads/main/libs/gui/GLConsumerUtils.cpp),
+[OES external images](https://registry.khronos.org/OpenGL/extensions/OES/OES_EGL_image_external.txt),
+[KHR image lifetime](https://registry.khronos.org/EGL/extensions/KHR/EGL_KHR_image_base.txt).
+
+`JAVA_HOME=... python3 debug/surface_texture_external_gate.py` passes 731 checks
+using the real JNI/ANGLE Vulkan path and generated frames: sampled colors and
+orientation, padded row strides, repeated size changes, texture reattachment,
+timestamps, PBO/unpack/binding preservation, retained GL errors, and unchanged
+software orientation. The old upload deterministically fails with error 0x502.
+The existing `native_texture_window_gate.py` also passes.
+
+The owner confirmed the previously black Tencent live now plays **upright with
+sound**. The recurring GL errors are absent. The protection warning remains
+active in the supplied protected Agora room and is a separate issue. These
+changes do not modify app checks, protection settings, or secure-window capture.
+
+Earlier API 36 sessions ended in `liteav_video_decoder` SIGSEGV/SIGBUS faults,
+including a failure while restarting the decoder. The texture fix is not yet
+proof that these independent native stability failures are resolved.
 
 ### Native runtime hardening
 
