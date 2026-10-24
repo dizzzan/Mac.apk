@@ -17,6 +17,15 @@ import java.nio.file.attribute.PosixFileAttributes;
 public class Os {
     public Os() {}
 
+    /** AOSP Os.chmod delegates to Linux_chmod, which follows symlinks and
+     *  retries EINTR. Use the host syscall so all permission and special
+     *  mode bits are applied, with failures reported as Android errno. */
+    public static void chmod(String path, int mode) throws ErrnoException {
+        if (path == null) throw new NullPointerException("path == null");
+        int r = com.macapk.loader.NativeOs.chmod(path, mode);
+        if (r < 0) throw new ErrnoException("chmod", -r);
+    }
+
     /** lstat — stat the *link* itself, not the target. AOSP throws
      *  ErrnoException on missing. Our impl handles symlinks via
      *  java.nio.file with NOFOLLOW_LINKS. */

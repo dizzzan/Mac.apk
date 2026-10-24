@@ -56,6 +56,36 @@ namespace osnative {
 
 namespace {
 
+// AOSP libcore/luni/src/main/native/libcore_io_Linux.cpp: Linux_chmod uses
+// TEMP_FAILURE_RETRY(chmod(path, mode)). Darwin and Bionic use the same mode
+// bits (07777), but these filesystem errno values differ. Other chmod errors
+// (EPERM, ENOENT, EINTR, EIO, EACCES, EFAULT, ENOTDIR, EINVAL, EROFS) agree.
+jint NativeOs_chmod(JNIEnv* env, jclass, jstring jpath, jint mode) {
+    if (jpath == nullptr) {
+        jclass npe = env->FindClass("java/lang/NullPointerException");
+        if (npe != nullptr) env->ThrowNew(npe, "path == null");
+        return 0;
+    }
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    if (path == nullptr) return 0; // GetStringUTFChars left an exception pending.
+    int rc;
+    do { rc = ::chmod(path, static_cast<mode_t>(mode)); }
+    while (rc < 0 && errno == EINTR);
+    int e = errno;
+    env->ReleaseStringUTFChars(jpath, path);
+    if (rc == 0) return 0;
+    switch (e) {
+        case ELOOP: e = 40; break;          // Darwin 62 -> Bionic 40
+        case ENAMETOOLONG: e = 36; break;   // Darwin 63 -> Bionic 36
+        case ENOTSUP: e = 95; break;        // Darwin 45 -> Bionic 95
+#if EOPNOTSUPP != ENOTSUP
+        case EOPNOTSUPP: e = 95; break;     // Darwin 102 -> Bionic 95
+#endif
+        case ESTALE: e = 116; break;        // Darwin 70 -> Bionic 116
+    }
+    return -e;
+}
+
 jlong NativeOs_lseek(JNIEnv*, jclass, jint fd, jlong offset, jint whence) {
     off_t r = ::lseek((int)fd, (off_t)offset, (int)whence);
     return (r == (off_t)-1) ? (jlong)(-errno) : (jlong)r;
@@ -468,6 +498,7 @@ jbyteArray NativeOs_xzDecompress(JNIEnv* env, jclass, jbyteArray in) {
 }
 
 const JNINativeMethod kNativeOsMethods[] = {
+    {(char*)"chmod",       (char*)"(Ljava/lang/String;I)I", (void*)NativeOs_chmod},
     {(char*)"xzDecompress", (char*)"([B)[B",          (void*)NativeOs_xzDecompress},
     {(char*)"open",        (char*)"(Ljava/lang/String;II)I", (void*)NativeOs_open},
     {(char*)"lseek",       (char*)"(IJI)J",                 (void*)NativeOs_lseek},
