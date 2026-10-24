@@ -68,6 +68,7 @@ public class Surface implements android.os.Parcelable {
     // association to place decoded video at the view's rect instead of over
     // the whole window -- see SurfaceView.macapkActiveVideoRectPacked.
     private SurfaceView mOwnerSurfaceView;
+    private SurfaceControl.Layer mControlLayer;
 
     // lockCanvas()/unlockCanvasAndPost() state. AOSP keeps one persistent
     // Canvas (mCanvas) reused across locks and a native mLockedObject handle
@@ -86,6 +87,17 @@ public class Surface implements android.os.Parcelable {
     private float mFrameRate;
 
     public Surface() {}
+    /** AOSP Surface(SurfaceControl): a producer for the control's buffer queue. */
+    public Surface(SurfaceControl from) { copyFrom(from); }
+
+    public void copyFrom(SurfaceControl other) {
+        if (other == null) throw new IllegalArgumentException("other must not be null");
+        SurfaceControl.Layer layer = other.macapkLayer();
+        mControlLayer = layer;
+        mSurfaceTexture = null;
+        mOwnerSurfaceView = null;
+        mReleased = false;
+    }
     public Surface(android.graphics.SurfaceTexture surfaceTexture) {
         mSurfaceTexture = surfaceTexture;
         // See the file header ("THE VIDEO-DECODE HAND-OFF POINT"). Harmless
@@ -118,7 +130,7 @@ public class Surface implements android.os.Parcelable {
         mOwnerSurfaceView = owner;
     }
     public SurfaceView macapkGetOwnerSurfaceView() {
-        return mOwnerSurfaceView;
+        return mControlLayer == null ? mOwnerSurfaceView : mControlLayer.owner(false);
     }
 
     /** Mac.apk framework-internal, called by the Bionic shim's
@@ -128,7 +140,7 @@ public class Surface implements android.os.Parcelable {
      *  fed by native code. The owner then composites below its window and punches
      *  its hole (SurfaceView "native window owner"). */
     public void macapkNoteNativeWindowConsumer() {
-        SurfaceView.macapkNoteNativeWindowOwner(mOwnerSurfaceView);
+        SurfaceView.macapkNoteNativeWindowOwner(macapkGetOwnerSurfaceView());
     }
 
     /** Post a CPU ANativeWindow buffer to this Surface's own consumer. The
@@ -142,13 +154,18 @@ public class Surface implements android.os.Parcelable {
                 null, null, false);
             return true;
         }
-        if (mOwnerSurfaceView != null) {
-            if (mOwnerSurfaceView.macapkPresentThroughSurfaceLayer(pixels, width, height)) return true;
-            int[] placed = mOwnerSurfaceView.macapkPlaceInDisplay(pixels, width, height);
+        SurfaceView owner = mControlLayer == null ? mOwnerSurfaceView : mControlLayer.owner(true);
+        // A producer may queue buffers before its layer is attached/shown.
+        // They must not escape to the whole window while no consumer is visible.
+        if (mControlLayer != null && owner == null) return true;
+        if (owner != null) {
+            if (mControlLayer != null) SurfaceView.macapkNoteNativeWindowOwner(owner);
+            if (owner.macapkPresentThroughSurfaceLayer(pixels, width, height)) return true;
+            int[] placed = owner.macapkPlaceInDisplay(pixels, width, height);
             if (placed != null) {
                 pixels = placed;
-                width = mOwnerSurfaceView.macapkCompositeW;
-                height = mOwnerSurfaceView.macapkCompositeH;
+                width = owner.macapkCompositeW;
+                height = owner.macapkCompositeH;
             }
         }
         com.macapk.loader.NativeCocoa.presentBitmap(pixels, width, height);
@@ -404,6 +421,7 @@ public class Surface implements android.os.Parcelable {
             Surface other = (Surface) o;
             mSurfaceTexture = other.mSurfaceTexture;
             mOwnerSurfaceView = other.mOwnerSurfaceView;
+            mControlLayer = other.mControlLayer;
             mReleased = other.mReleased;
         }
     }

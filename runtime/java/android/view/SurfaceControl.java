@@ -6,16 +6,17 @@ import android.graphics.Region;
 import android.os.Parcel;
 import android.os.Parcelable;
 import java.io.Closeable;
+import java.lang.ref.WeakReference;
 
 /**
  * AOSP-faithful (minimal) android.view.SurfaceControl. Real Android uses this as
  * a SurfaceFlinger layer handle plus a batched Transaction for compositor-side
  * geometry/visibility. Mac.apk has no SurfaceFlinger (each Window is a Cocoa
  * NSWindow / Metal layer composited by macOS), so SurfaceControl is a faithful
- * handle whose Transaction setters chain and record but apply() is a no-op. This
- * keeps the public API surface (Builder + Transaction) intact so libraries that
- * construct transactions for shared-element transitions / SurfaceView z-ordering
- * link and run without a SurfaceFlinger. Mirrors
+ * handle. Transactions apply parent, buffer-size and visibility changes before
+ * notifying listeners. Surface producers follow the layer's parent chain to
+ * the owning SurfaceView, which supplies the host compositor's destination.
+ * Other compositor geometry is currently supplied by that view. Mirrors
  * frameworks/base/core/java/android/view/SurfaceControl.java.
  */
 public final class SurfaceControl implements Parcelable {
@@ -23,6 +24,37 @@ public final class SurfaceControl implements Parcelable {
     private int mWidth;
     private int mHeight;
     private boolean mValid = true;
+    private Layer mLayer = new Layer();
+    private static final Object LAYER_LOCK = new Object();
+
+    // A Surface retains the buffer queue, independently of the Java control
+    // handle. Releasing a control must not invalidate existing producers or
+    // detach children; reparent(child, null) explicitly detaches a layer.
+    static final class Layer {
+        Layer parent;
+        WeakReference<View> owner = new WeakReference<>(null);
+        boolean visible = true;
+
+        SurfaceView owner(boolean requireVisible) {
+            synchronized (LAYER_LOCK) {
+                java.util.Set<Layer> visited = java.util.Collections.newSetFromMap(
+                        new java.util.IdentityHashMap<Layer, Boolean>());
+                SurfaceView result = null;
+                for (Layer layer = this; layer != null; layer = layer.parent) {
+                    if (!visited.add(layer) || (requireVisible && !layer.visible)) return null;
+                    View view = layer.owner.get();
+                    if (result == null && view instanceof SurfaceView) result = (SurfaceView) view;
+                }
+                return result;
+            }
+        }
+    }
+
+    Layer macapkLayer() {
+        if (!mValid) throw new NullPointerException(
+                "null SurfaceControl native object. Are you using a released SurfaceControl?");
+        return mLayer;
+    }
 
     SurfaceControl(String name, int width, int height) {
         mName = name;
@@ -64,6 +96,7 @@ public final class SurfaceControl implements Parcelable {
         mName = in.readString();
         mWidth = in.readInt();
         mHeight = in.readInt();
+        mLayer = new Layer();
         mValid = true;
     }
 
@@ -103,8 +136,7 @@ public final class SurfaceControl implements Parcelable {
 
     /** AOSP SurfaceControl.TransactionCommittedListener: told once a transaction
      *  has been latched by the compositor. Mac.apk applies transactions
-     *  synchronously (apply() is a no-op because macOS composites the window
-     *  itself), so "committed" is true the moment apply() returns -- see
+     *  synchronously, so "committed" is true the moment apply() returns -- see
      *  Transaction.apply(). */
     public interface TransactionCommittedListener {
         void onTransactionCommitted();
@@ -165,6 +197,9 @@ public final class SurfaceControl implements Parcelable {
         private String mName = "SurfaceControl";
         private int mWidth;
         private int mHeight;
+        private SurfaceControl mParent;
+        private View mOwner;
+        private boolean mHidden = true;
 
         public Builder() {}
         public Builder(Object session) {}  // SurfaceSession overload (untyped: no SurfaceSession in tree)
@@ -177,8 +212,8 @@ public final class SurfaceControl implements Parcelable {
         public Builder setProtected(boolean protectedContent) { return this; }
         public Builder setSecure(boolean secure) { return this; }
         public Builder setOpaque(boolean opaque) { return this; }
-        public Builder setHidden(boolean hidden) { return this; }
-        public Builder setParent(SurfaceControl parent) { return this; }
+        public Builder setHidden(boolean hidden) { mHidden = hidden; return this; }
+        public Builder setParent(SurfaceControl parent) { mParent = parent; return this; }
         public Builder setMetadata(int key, int data) { return this; }
         public Builder setEffectLayer() { return this; }
         public Builder setColorLayer() { return this; }
@@ -186,30 +221,50 @@ public final class SurfaceControl implements Parcelable {
         public Builder setContainerLayer() { return this; }
         public Builder setFlags(int flags) { return this; }
         public Builder setCallsite(String callsite) { return this; }
-        public Builder setLocalOwnerView(View view) { return this; }
+        public Builder setLocalOwnerView(View view) { mOwner = view; return this; }
 
         public SurfaceControl build() {
-            return new SurfaceControl(mName, mWidth, mHeight);
+            SurfaceControl control = new SurfaceControl(mName, mWidth, mHeight);
+            control.mLayer.parent = mParent == null ? null : mParent.macapkLayer();
+            control.mLayer.owner = new WeakReference<>(mOwner);
+            control.mLayer.visible = !mHidden;
+            return control;
         }
     }
 
     /**
-     * A batch of compositor changes. Setters chain and record; apply() is a
-     * no-op because macOS composites our windows directly.
+     * A batch of compositor changes. Parentage becomes observable at apply(),
+     * before committed listeners run, including for already-created Surfaces.
      */
     public static class Transaction implements Closeable, Parcelable {
         public Transaction() {}
+        private final java.util.ArrayList<Runnable> mChanges = new java.util.ArrayList<>();
 
-        public void apply() { macapkFireCommitted(); }
-        public void apply(boolean sync) { macapkFireCommitted(); }
-        public void applyAsyncUnsafe() {}
+        public void apply() {
+            synchronized (LAYER_LOCK) {
+                for (Runnable change : mChanges) change.run();
+                mChanges.clear();
+            }
+            macapkFireCommitted();
+        }
+        public void apply(boolean sync) { apply(); }
+        public void applyAsyncUnsafe() { apply(); }
 
-        public Transaction setVisibility(SurfaceControl sc, boolean visible) { return this; }
-        public Transaction show(SurfaceControl sc) { return this; }
-        public Transaction hide(SurfaceControl sc) { return this; }
+        public Transaction setVisibility(SurfaceControl sc, boolean visible) {
+            Layer layer = sc.macapkLayer();
+            mChanges.add(() -> layer.visible = visible);
+            return this;
+        }
+        public Transaction show(SurfaceControl sc) { return setVisibility(sc, true); }
+        public Transaction hide(SurfaceControl sc) { return setVisibility(sc, false); }
         public Transaction setPosition(SurfaceControl sc, float x, float y) { return this; }
         public Transaction setScale(SurfaceControl sc, float scaleX, float scaleY) { return this; }
-        public Transaction setBufferSize(SurfaceControl sc, int w, int h) { return this; }
+        public Transaction setBufferSize(SurfaceControl sc, int w, int h) {
+            sc.macapkLayer();
+            if (w < 0 || h < 0) throw new IllegalArgumentException("width and height must be positive");
+            mChanges.add(() -> { sc.mWidth = w; sc.mHeight = h; });
+            return this;
+        }
         public Transaction setLayer(SurfaceControl sc, int z) { return this; }
         public Transaction setRelativeLayer(SurfaceControl sc, SurfaceControl relativeTo, int z) {
             return this;
@@ -229,9 +284,24 @@ public final class SurfaceControl implements Parcelable {
         public Transaction setColor(SurfaceControl sc, float[] color) { return this; }
         public Transaction setOpaque(SurfaceControl sc, boolean isOpaque) { return this; }
         public Transaction setSecure(SurfaceControl sc, boolean isSecure) { return this; }
-        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) { return this; }
+        public Transaction reparent(SurfaceControl sc, SurfaceControl newParent) {
+            Layer layer = sc.macapkLayer();
+            Layer parent = newParent == null ? null : newParent.macapkLayer();
+            mChanges.add(() -> layer.parent = parent);
+            return this;
+        }
         public Transaction setBuffer(SurfaceControl sc, Object buffer) { return this; }
-        public Transaction merge(Transaction other) { return this; }
+        public Transaction merge(Transaction other) {
+            if (other == this) return this;
+            mChanges.addAll(other.mChanges);
+            other.mChanges.clear();
+            if (other.mCommittedListeners != null) {
+                if (mCommittedListeners == null) mCommittedListeners = new java.util.ArrayList<>();
+                mCommittedListeners.addAll(other.mCommittedListeners);
+                other.mCommittedListeners = null;
+            }
+            return this;
+        }
 
         // ---- AOSP API-36 surface completion (android.view lane) -------------
         // Same contract as every setter above: chain and record, because macOS
@@ -333,7 +403,7 @@ public final class SurfaceControl implements Parcelable {
          *  deprecated at API 35. */
         public Transaction clearTrustedPresentationCallback(SurfaceControl sc) { return this; }
 
-        @Override public void close() {}
+        @Override public void close() { mChanges.clear(); mCommittedListeners = null; }
         @Override public int describeContents() { return 0; }
         @Override public void writeToParcel(Parcel dest, int flags) {}
 

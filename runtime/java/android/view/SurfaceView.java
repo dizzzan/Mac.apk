@@ -4050,22 +4050,17 @@ public class SurfaceView extends View implements MetalSurfaceCallbacks {
     //  AOSP API-36 surface completion (Mac.apk API-gap lane, android.view).
     // ======================================================================
 
-    /** AOSP SurfaceView.getSurfaceControl(): the SurfaceControl backing this
-     *  view's dedicated compositor layer. Mac.apk draws SurfaceView content into
-     *  the SAME ANGLE/Metal layer as the rest of the window rather than a
-     *  separate SurfaceFlinger layer, so there is no layer of its own -- but the
-     *  handle must be non-null and STABLE, because the standard idiom is
-     *  `new SurfaceControl.Transaction().setPosition(sv.getSurfaceControl(), ...)`
-     *  and a null there is an immediate NPE inside the app. The transaction is a
-     *  recording no-op (see SurfaceControl.Transaction), so a caller gets the
-     *  same "queued and applied" answer it would on a device; what it does not
-     *  get is a visible effect, which is already true of every other
-     *  SurfaceControl operation in this tree. Referenced by YouTube. */
+    /** AOSP SurfaceView.getSurfaceControl(): the stable control backing this
+     *  view's compositor layer. Child buffer layers inherit the destination
+     *  through their parent chain, including after a transaction reparents an
+     *  existing producer to another SurfaceView. */
     private SurfaceControl mSurfaceControl;
     public SurfaceControl getSurfaceControl() {
         if (mSurfaceControl == null) {
             mSurfaceControl = new SurfaceControl.Builder()
                     .setName("SurfaceView[" + getClass().getSimpleName() + "]")
+                    .setLocalOwnerView(this)
+                    .setHidden(false)
                     .build();
         }
         return mSurfaceControl;
