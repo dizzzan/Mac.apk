@@ -1013,7 +1013,7 @@ public class Application extends ContextWrapper
      *  StackOverflow (FATAL AppInit1, System.exit(10)) in attachBaseContext, before
      *  the first activity. Same terminator rule as getContentResolver /
      *  getSystemService. The shared prefsCache keeps one object per file. */
-    synchronized SharedPreferences macapkGetSharedPreferencesReal(String name, int mode) {
+    SharedPreferences macapkGetSharedPreferencesReal(String name, int mode) {
         // AOSP's pre-KitKat null-name compat; the citation is on
         // android.content.Context.getSharedPreferences, which carries the same
         // branch. A no-op for every non-null name and every app at or above 19.
@@ -1024,14 +1024,17 @@ public class Application extends ContextWrapper
                 name = "null";
             }
         }
-        SharedPreferences p = prefsCache.get(name);
-        if (p != null) return p;
-        // Interned by FILE, not by this cache's key: the same file reached
-        // through a raw Context must be the SAME object, or two independent
-        // locks interleave the atomic-write dance and can destroy the data.
-        p = com.macapk.loader.SharedPrefsImpl.macapkGet(this, name);
-        prefsCache.put(name, p);
-        return p;
+        // Application subclasses can hold their own monitor during onCreate
+        // while waiting for a worker that reads preferences. Context caching
+        // must not acquire that application-owned lock.
+        synchronized (prefsCache) {
+            SharedPreferences p = prefsCache.get(name);
+            if (p != null) return p;
+            // Interned by FILE: raw Context and Application share one instance.
+            p = com.macapk.loader.SharedPrefsImpl.macapkGet(this, name);
+            prefsCache.put(name, p);
+            return p;
+        }
     }
 
     /** Cache of system service shims. Apps frequently fetch the same
@@ -1039,12 +1042,14 @@ public class Application extends ContextWrapper
      *  process and we mirror that. */
     private final HashMap<String, Object> systemServices = new HashMap<>();
 
-    @Override public synchronized Object getSystemService(String name) {
-        Object svc = systemServices.get(name);
-        if (svc != null) return svc;
-        svc = createSystemService(name);
-        if (svc != null) systemServices.put(name, svc);
-        return svc;
+    @Override public Object getSystemService(String name) {
+        synchronized (systemServices) {
+            Object svc = systemServices.get(name);
+            if (svc != null) return svc;
+            svc = createSystemService(name);
+            if (svc != null) systemServices.put(name, svc);
+            return svc;
+        }
     }
 
     private Object createSystemService(String name) {
