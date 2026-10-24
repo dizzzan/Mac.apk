@@ -602,9 +602,11 @@ extern "C" {
 
 // Called once by macapk-elfexec before it loads the guest: marks this process as an exec'd
 // guest program and publishes its exec envp as the guest environment.
+void __macapk_guest_cwd_exec();
 void __macapk_elfexec_process_init(char** envp) {
     g_elfexec_process = true;
     __macapk_guest_env_exec(envp);
+    __macapk_guest_cwd_exec();
 }
 
 // __macapk_arm64_dlopen's child-process route. Returns 1 when it HANDLED the request (the

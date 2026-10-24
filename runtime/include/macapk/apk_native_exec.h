@@ -32,6 +32,11 @@ namespace macapk {
 //   would otherwise fail for anyone who was not told about a flag.
 // MACAPK_ELFEXEC=0: escape hatch for A/B bisection. The OFF pass reverts any
 //   previously installed stand-in, so flipping back needs no cache wipe.
+// MACAPK_ELFEXEC_PRESERVE_FILES=1: experimental alternative layout. Keep the
+//   original ELF at its installed path and put the host launcher in the sidecar.
+//   Requires the matching ProcessImpl/native exec bridge and elfexec helper.
+//   Java ProcessBuilder/Runtime.exec and native execv/execve are supported;
+//   shell-mediated launches and native execvp/posix_spawn are not routed yet.
 //
 // Idempotent, and cheap enough to run on every launch (a directory walk over a
 // handful of files, reading only each file's first page). Runs OUTSIDE the

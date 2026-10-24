@@ -134,6 +134,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -317,19 +318,60 @@ bool gate_on() {
 // app's canExecute()/exists() checks depend on our bin dir surviving a move.
 bool install_helper(const fs::path& helper, const fs::path& dst) {
     std::error_code ec;
-    fs::remove(dst, ec);
-    fs::copy_file(helper, dst, fs::copy_options::overwrite_existing, ec);
+    const fs::path staged = dst.string() + ".next-" + std::to_string(::getpid());
+    fs::copy_file(helper, staged, fs::copy_options::overwrite_existing, ec);
     if (ec) {
         std::fprintf(stderr,
             "[macapk] elfexec: cannot copy %s -> %s: %s\n",
             helper.c_str(), dst.c_str(), ec.message().c_str());
+        fs::remove(staged, ec);
         return false;
     }
-    return set_exec_mode(dst);
+    if (!set_exec_mode(staged)) { fs::remove(staged, ec); return false; }
+    fs::rename(staged, dst, ec);
+    if (ec) { fs::remove(staged, ec); return false; }
+    return true;
+}
+
+size_t preserve_dir(const fs::path& libdir, const fs::path& helper) {
+    std::error_code ec;
+    const fs::path sidecar = libdir / kSidecarDir;
+    fs::create_directories(sidecar, ec);
+    if (ec) return 0;
+    // Migrate the old layout atomically: the stashed original replaces only
+    // our Mach-O stand-in. Never overwrite an independently replaced ELF.
+    std::vector<fs::path> originals;
+    for (fs::directory_iterator it(sidecar, ec), end; it != end; it.increment(ec)) {
+        if (ec) return 0;
+        if (it->is_regular_file(ec) && is_elf(it->path())) originals.push_back(it->path());
+    }
+    for (const auto& stashed : originals) {
+        fs::path visible = libdir / stashed.filename();
+        if (fs::exists(visible, ec) && !is_macho(visible)) {
+            std::fprintf(stderr, "[macapk] elfexec: conflicting original at %s; leaving both files intact\n", visible.c_str());
+            return 0;
+        }
+        fs::rename(stashed, visible, ec);
+        if (ec) return 0;
+        set_exec_mode(visible);
+    }
+    size_t installed = 0;
+    for (fs::directory_iterator it(libdir, ec), end; it != end; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec) || !classify(it->path()).is_exec) continue;
+        if (install_helper(helper, sidecar / it->path().filename())) ++installed;
+    }
+    if (installed) {
+        std::ofstream marker(sidecar / ".layout");
+        marker << "preserve-elf-v1\n";
+    }
+    return installed;
 }
 
 size_t reconcile_dir(const fs::path& libdir, const fs::path& helper,
                      bool on, size_t* reverted) {
+    const char* preserve = std::getenv("MACAPK_ELFEXEC_PRESERVE_FILES");
+    if (on && preserve && preserve[0] == '1') return preserve_dir(libdir, helper);
     std::error_code ec;
     const fs::path sidecar = libdir / kSidecarDir;
     size_t installed = 0;
@@ -382,6 +424,7 @@ size_t reconcile_dir(const fs::path& libdir, const fs::path& helper,
             // because the revert loop above is keyed on the ELF magic rather
             // than on this list.
             fs::remove(sidecar / kShimDirFile, ec);
+            fs::remove(sidecar / ".layout", ec);
             fs::remove(sidecar / "elfexec.log", ec);
             fs::remove(sidecar, ec);        // only succeeds when empty
         }

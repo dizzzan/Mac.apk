@@ -428,9 +428,19 @@ void* find_shim(const std::string& sidecar_dir) {
 int main(int argc, char** argv, char** envp) {
     std::string self = self_path();
     if (self.empty()) die("cannot determine my own path");
-    const std::string dir     = dir_of(self);
-    const std::string sidecar = dir + "/" + kSidecarDir;
-    const std::string elf     = sidecar + "/" + base_of(self);
+    std::string dir     = dir_of(self);
+    std::string sidecar = dir + "/" + kSidecarDir;
+    std::string elf     = sidecar + "/" + base_of(self);
+    if (base_of(dir) == kSidecarDir) {
+        // In the preserved-file layout only exec selects this sidecar. Its
+        // first argument is the original argv[0], including relative spelling.
+        sidecar = dir;
+        dir = dir_of(dir);
+        elf = dir + "/" + base_of(self);
+        if (argc < 2) die("missing guest argv[0]");
+        --argc;
+        ++argv;
+    }
 
     if (!is_file(elf)) {
         // Hand-run diagnostic: dump what needed_of() sees in an ELF, so the

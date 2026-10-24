@@ -2042,6 +2042,14 @@ static int RunGmsCommand(const std::string& bin_dir,
     JNIEnv* env = nullptr;
     StartJvm(cfg, &vm, &env);
     RegisterAllNativeMethods(env);
+    if (const char* preserve = std::getenv("MACAPK_ELFEXEC_PRESERVE_FILES"); preserve && preserve[0] == '1') {
+        extern bool RegisterNativeProcessBridge(JNIEnv*);
+        if (!RegisterNativeProcessBridge(env)) {
+            if (env->ExceptionCheck()) env->ExceptionDescribe();
+            std::fprintf(stderr, "[macapk] cannot install preserved-ELF process bridge\n");
+            std::exit(1);
+        }
+    }
 
     jclass cls = env->FindClass("com/macapk/gms/GmsCli");
     if (!cls) {

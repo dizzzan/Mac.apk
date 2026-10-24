@@ -30,6 +30,7 @@
 #include "native_window_pixels.h"
 #include "a64_dynamic_syscall.h"
 #include "fault_wx_pages.h"
+#include "../../include/macapk/apk_exec_path.h"
 #include "vk_window_surface_policy.h"  // MACAPK_VK_WINDOW_SURFACE decision (egl window-surface bridge)
 #include <climits>         // INT_MAX for the __ppoll_chk timeout clamp
 #include <exception>
@@ -42250,6 +42251,13 @@ static inline bool macapk_linux_oflags_write(int f) {
 // syscalls 17 / 50 behave as before (libSystem fchdir and getcwd with host errno;
 // -ENOSYS by number).
 static std::atomic<bool> g_macapk_guest_cwd_changed{false};
+static bool g_macapk_guest_exec_cwd = false;
+extern "C" void __macapk_guest_cwd_exec() {
+    // exec preserves the caller's cwd. Only a zygote-style app launch starts
+    // with the virtual "/" view; a native child inherits its real directory.
+    g_macapk_guest_exec_cwd = true;
+    g_macapk_guest_cwd_changed.store(true, std::memory_order_release);
+}
 static bool macapk_relpath_cwd_on() {
     static const bool on = [] {
         const char* e = std::getenv("MACAPK_RELPATH_CWD");
@@ -45792,6 +45800,30 @@ static inline int macapk_linux_rc(int rc) {
     return rc;
 }
 
+static int macapk_execve_host(const char* path, char* const argv[], char* const envp[]) {
+    if (!path || !argv) { errno = EFAULT; return -1; }
+    const std::string host = macapk_new_shim_abs_path(path);
+    char launcher[PATH_MAX];
+    if (!macapk::ApkExecLauncher(host.c_str(), nullptr, launcher, sizeof launcher))
+        return ::execve(host.c_str(), argv, envp);
+    size_t argc = 0;
+    while (argv[argc]) {
+        if (++argc > ARG_MAX / sizeof(char*) - 2) { errno = E2BIG; return -1; }
+    }
+    // Keep the argv pointer array on the stack. The host's argument-size
+    // limit bounds this temporary storage.
+    auto next = static_cast<char**>(__builtin_alloca((argc + 2) * sizeof(char*)));
+    next[0] = launcher;
+    for (size_t i = 0; i <= argc; ++i) next[i + 1] = argv[i];
+    return ::execve(launcher, next, envp);
+}
+extern "C" int __macapk_arm64_execve(const char* path, char* const argv[], char* const envp[]) {
+    return macapk_linux_rc(macapk_execve_host(path, argv, envp));
+}
+extern "C" int __macapk_arm64_execv(const char* path, char* const argv[]) {
+    return __macapk_arm64_execve(path, argv, __macapk_arm64_environ);
+}
+
 // char* realpath(const char* path, char* resolved). Bionic's PATH_MAX is 4096
 // (linux/limits.h, which bionic/libc/include/limits.h includes); Darwin's is 1024
 // (sys/syslimits.h:103), so a caller buffer sized for Bionic always holds
@@ -45866,6 +45898,7 @@ static bool macapk_host_cwd_is_guest_root() {
     char rp[PATH_MAX];
     const std::string root = macapk_new_shim_abs_path("/");
     if (::realpath(root.c_str(), rp) && std::strcmp(rp, now) == 0) return true;
+    if (g_macapk_guest_exec_cwd) return false;
     const std::string& inh = macapk_guest_inherited_cwd();
     if (inh.empty()) return false;
     if (::realpath(inh.c_str(), rp)) return std::strcmp(rp, now) == 0;
@@ -49072,6 +49105,8 @@ extern "C" long __macapk_arm64_syscall_impl(long number, long a1, long a2,
         case 209:  return macapk_router_from_linux((long)__macapk_arm64_getsockopt((int)a1, (int)a2, (int)a3, (void*)macapk_untag_ptr((void*)a4), (socklen_t*)a5));  // getsockopt
         case 216:  return (long)__macapk_arm64_mremap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (size_t)a3, (int)a4);  // mremap
         case 215:  return (long)__macapk_arm64_libunity_munmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2);
+        case 221:  return macapk_execve_host((const char*)macapk_untag_ptr((void*)a1),
+                       (char* const*)macapk_untag_ptr((void*)a2), (char* const*)macapk_untag_ptr((void*)a3));
         case 222:  return (long)__macapk_arm64_mmap((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3, (int)a4, (int)a5, (off_t)a6);  // mmap
         case 226:  return (long)__macapk_arm64_mprotect((void*)macapk_untag_ptr((void*)a1), (size_t)a2, (int)a3);  // mprotect
         case 232:  return __macapk_arm64_mincore((void*)a1, (size_t)a2, (unsigned char*)a3);
