@@ -1160,6 +1160,7 @@ public class TextView extends View
                 for (android.text.TextWatcher w : textWatchers) {
                     try { w.onTextChanged(n, 0, oldLen, n.length()); } catch (Throwable ignored) {}
                 }
+                onTextChanged(n, 0, oldLen, n.length());
                 if (n instanceof android.text.Editable) {
                     for (android.text.TextWatcher w : textWatchers) {
                         try { w.afterTextChanged((android.text.Editable) n); } catch (Throwable ignored) {}
@@ -1169,6 +1170,7 @@ public class TextView extends View
         } else {
             macapkSetTextInternal(n);
             macapkInitializeMovement();
+            onTextChanged(n, 0, old != null ? old.length() : 0, n.length());
         }
         // AOSP setText (:7166-7167): the movement method initializes the new
         // buffer (ArrowKeyMovementMethod -> selection 0) BEFORE
@@ -2305,7 +2307,15 @@ public class TextView extends View
             for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
                 try { w.beforeTextChanged(buf, oldLen, 0, added); } catch (Throwable ignored) {}
         }
-        if (added > 0) { try { buf.append(add, addStart, addEnd); } catch (Throwable ignored) {} }
+        // This path sends notifications below. Mute the Editable's watcher
+        // even when there are no external listeners, so the subclass hook
+        // receives one callback per edit, not one here and another below.
+        boolean wasFiring = firingWatchers;
+        firingWatchers = true;
+        try {
+            if (added > 0) buf.append(add, addStart, addEnd);
+        } catch (Throwable ignored) {
+        } finally { firingWatchers = wasFiring; }
         // append() mutates the Editable IN PLACE, so `text` may already BE
         // `buf` -- but mTransformed is a snapshot taken at the last setText and
         // does not observe in-place edits (PasswordCharSequence wraps the
@@ -2316,9 +2326,15 @@ public class TextView extends View
         if (fire) {
             for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
                 try { w.onTextChanged(buf, oldLen, 0, added); } catch (Throwable ignored) {}
-            for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
-                try { w.afterTextChanged(buf); } catch (Throwable ignored) {}
-            firingWatchers = false;
+        }
+        try {
+            onTextChanged(buf, oldLen, 0, added);
+            if (fire) {
+                for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
+                    try { w.afterTextChanged(buf); } catch (Throwable ignored) {}
+            }
+        } finally {
+            if (fire) firingWatchers = false;
         }
         requestLayout();
         invalidate();
@@ -2819,10 +2835,13 @@ public class TextView extends View
             mCachedEditableSrc = mCachedEditable;
             // AOSP handleTextChanged -> updateAfterEdit (:12424-12439).
             try { macapkUpdateAfterEdit(); } catch (Throwable ignored) {}
-            if (firingWatchers || textWatchers == null) return;
-            for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers)) {
-                try { w.onTextChanged(s, start, before, count); } catch (Throwable ignored) {}
+            if (firingWatchers) return;
+            if (textWatchers != null) {
+                for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers)) {
+                    try { w.onTextChanged(s, start, before, count); } catch (Throwable ignored) {}
+                }
             }
+            TextView.this.onTextChanged(s, start, before, count);
         }
         @Override public void afterTextChanged(android.text.Editable b) {
             if (b != mCachedEditable) return;
@@ -2952,10 +2971,16 @@ public class TextView extends View
         if (fire) {
             for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
                 try { w.onTextChanged(text, 0, old.length(), text.length()); } catch (Throwable ignore) {}
-            android.text.Editable e = getEditableText();
-            for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
-                try { w.afterTextChanged(e); } catch (Throwable ignore) {}
-            firingWatchers = false;
+        }
+        try {
+            onTextChanged(text, 0, old.length(), text.length());
+            if (fire) {
+                android.text.Editable e = getEditableText();
+                for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
+                    try { w.afterTextChanged(e); } catch (Throwable ignore) {}
+            }
+        } finally {
+            if (fire) firingWatchers = false;
         }
         invalidate();
     }
@@ -3149,10 +3174,13 @@ public class TextView extends View
             for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
                 try { w.beforeTextChanged(buf, a, removed, added); } catch (Throwable ignored) {}
         }
+        boolean wasFiring = firingWatchers;
+        firingWatchers = true;
         try {
             if (added > 0) buf.replace(a, b, ins);
             else if (removed > 0) buf.delete(a, b);
-        } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {
+        } finally { firingWatchers = wasFiring; }
         // The buffer BECOMES the text (append()'s rule): the ChangeWatcher does
         // this itself when it is on the buffer, and must not be relied on, since
         // only a default-editable view or one with a key listener carries it.
@@ -3169,9 +3197,18 @@ public class TextView extends View
         if (fire) {
             for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
                 try { w.onTextChanged(buf, a, removed, added); } catch (Throwable ignored) {}
-            for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
-                try { w.afterTextChanged(buf); } catch (Throwable ignored) {}
-            firingWatchers = false;
+        }
+        // AOSP setText/handleTextChanged notify listeners, then the virtual
+        // onTextChanged hook, then afterTextChanged. Custom editors depend on
+        // the hook even when no TextWatcher has been registered.
+        try {
+            onTextChanged(buf, a, removed, added);
+            if (fire) {
+                for (android.text.TextWatcher w : new java.util.ArrayList<>(textWatchers))
+                    try { w.afterTextChanged(buf); } catch (Throwable ignored) {}
+            }
+        } finally {
+            if (fire) firingWatchers = false;
         }
         requestLayout();
         invalidate();
