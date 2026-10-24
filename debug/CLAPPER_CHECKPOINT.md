@@ -17,7 +17,15 @@ state. show restores an already-attached window without repeating onStart or
 onShow, isShowing reports actual visibility, and dismiss removes hidden windows.
 This follows [AOSP Dialog](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/main/core/java/android/app/Dialog.java).
 The rebuilt Clapper app now opens the phone form and switches to the email form.
-Authenticated sign-in still requires verification with the owner's account.
+
+A second failure kept host keystrokes routed to the phone field after the email
+field gained focus. InputMethodManager had updated its served InputConnection,
+but the direct TextView target from showSoftInput still intercepted text first.
+Starting input for another view now drops that stale target, focus loss clears
+it, and the direct-target query checks focus just like the connection query.
+This follows the served-view handoff in AOSP InputMethodManager.checkFocus.
+Typing and backspace were visually verified in Clapper's email field; the test
+string was cleared. Authenticated sign-in still requires the owner's account.
 
 The regression fails on the previous implementation and passes all 13 checks
 with the fix, including touch routing, hide/show lifecycle counts, dismiss while
@@ -25,9 +33,14 @@ hidden, and reuse after dismissal. Run after building the Java jars:
 
 ```sh
 mkdir -p runtime/build/dialog-tests
-"$JAVA_HOME/bin/javac" -cp 'runtime/build/lib/*' -d runtime/build/dialog-tests debug/DialogVisibilityTest.java
+"$JAVA_HOME/bin/javac" -cp 'runtime/build/lib/*' -d runtime/build/dialog-tests debug/DialogVisibilityTest.java debug/InputMethodFocusTargetTest.java
 "$JAVA_HOME/bin/java" -Djava.awt.headless=true -cp 'runtime/build/dialog-tests:runtime/build/lib/*' DialogVisibilityTest
+"$JAVA_HOME/bin/java" -Djava.awt.headless=true -cp 'runtime/build/dialog-tests:runtime/build/lib/*' InputMethodFocusTargetTest
 ```
+
+The input-focus regression also fails before and passes after the fix (14 checks):
+editor switching, restartInput, custom InputConnection routing, non-editor focus,
+explicit hide, and resuming input.
 
 ## Playback failure and fix
 

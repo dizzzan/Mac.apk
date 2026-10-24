@@ -32,6 +32,7 @@ public class InputMethodManager {
     private static final boolean sTrace = "1".equals(System.getenv("MACAPK_TRACE_IME"));
     private static volatile android.widget.TextView sActiveInput;
     public static android.widget.TextView macapkActiveInput() {
+        macapkCheckFocus();
         android.widget.TextView v = sActiveInput;
         if (v == null) return null;
         // Unity's soft input closes by setVisibility(GONE)/ViewGroup.removeView,
@@ -97,6 +98,11 @@ public class InputMethodManager {
      *         the gate below.
      */
     private void macapkStartInput(View view, boolean appRequested) {
+        // AOSP checkFocusInternalLocked replaces mServedView with the newly
+        // focused view before starting input. Our direct TextView route must
+        // follow that same handoff: otherwise a prior showSoftInput target
+        // consumes keys ahead of the new editor's InputConnection.
+        if (sActiveInput != view) sActiveInput = null;
         if (view == null) {
             sServedView = null; sActiveConnection = null; sCurrentEditorInfo = null;
             return;
@@ -258,6 +264,7 @@ public class InputMethodManager {
             // next checkFocus re-target. Clearing the connection here is safe
             // and simpler, and the next query re-binds whatever now has focus.
             sServedView = null; sActiveConnection = null; sCurrentEditorInfo = null;
+            if (sActiveInput == view) sActiveInput = null;
         }
     }
 
