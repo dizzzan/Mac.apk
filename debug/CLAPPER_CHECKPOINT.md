@@ -90,6 +90,30 @@ not used as evidence of an audio-backend defect. Live video and audio therefore
 work in the confirmed session; the environment warning seen in other sessions
 remains unresolved, and broad live-stream compatibility is not established.
 
+## Loading overlay lifetime
+
+Clapper's live loading window stayed over a playing stream and intercepted
+every gesture. Its normal completion handler only calls WindowManager.removeView
+when the loading view has a parent. WindowOverlayStack attached and drew the
+root but left getParent() null, so the handler discarded its reference without
+removing the window.
+
+Each overlay layer now supplies the root's non-View ViewParent, assigned before
+attachment and cleared after detachment. Parent invalidation/layout requests
+schedule the compositor. This follows the parent lifetime in
+[AOSP ViewRootImpl.setView/dispatchDetachedFromWindow](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android14-release/core/java/android/view/ViewRootImpl.java).
+The app's own completion handler now removes LoaderView (the overlay stack
+returns to zero), and the live screen visibly has no loading spinner. Touch
+events reach LiveAudienceActivity. Stream switching is still under validation.
+
+`debug/WindowOverlayParentTest.java` fails before the change and passes 20
+checks afterward: guarded cleanup, attach/detach callback ordering, subtree
+preservation, root-parent invalidation/layout scheduling, touch release,
+independent windows, reuse and activity cleanup. DialogVisibilityTest's 13
+checks also pass. WindowDecorContentTest passes with its required
+`MACAPK_WINDOW_PRESERVE_DECOR=1` profile; without that opt-in, it fails the same
+first assertion on both the previous and updated implementation.
+
 ## Login dialog visibility
 
 The "Use Phone / Email" button started LoginActivity, but the previous sign-in

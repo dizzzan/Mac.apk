@@ -18,6 +18,7 @@ import android.graphics.Rect;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.WindowManager;
 
 import java.util.ArrayList;
@@ -26,7 +27,7 @@ import java.util.List;
 public final class WindowOverlayStack {
 
     /** One floating window: its root view plus the params that place it. */
-    public static final class Layer {
+    public static final class Layer implements ViewParent {
         public final View view;
         public WindowManager.LayoutParams params;
         public final Rect bounds = new Rect();   // last laid-out screen rect
@@ -50,6 +51,28 @@ public final class WindowOverlayStack {
             this.params = params;
             android.app.Activity a = activityOf(view != null ? view.getContext() : null);
             if (a != null) ownerActivity = new java.lang.ref.WeakReference<>(a);
+        }
+
+        // AOSP ViewRootImpl.setView assigns itself as the root's non-View
+        // parent; dispatchDetachedFromWindow clears it AFTER detach callbacks.
+        // Our layer owns that window lifetime. Without this parent, an app's
+        // `if (loadingView.getParent() != null) wm.removeView(loadingView)`
+        // silently skips removal, leaving a modal overlay swallowing touches.
+        @Override public void requestLayout() {
+            sDirty = true;
+            android.view.ViewRootImpl.scheduleLayout();
+        }
+        @Override public boolean isLayoutRequested() { return view.isLayoutRequested(); }
+        @Override public void invalidateChild(View child, Rect dirty) {
+            sDirty = true;
+            android.view.ViewRootImpl.schedule();
+        }
+        @Override public ViewParent invalidateChildInParent(int[] location, Rect dirty) {
+            invalidateChild(view, dirty);
+            return null;
+        }
+        @Override public void onDescendantInvalidated(View child, View target) {
+            invalidateChild(child, null);
         }
     }
 
@@ -180,9 +203,8 @@ public final class WindowOverlayStack {
 
     private static void giveRootItsParams(View view, WindowManager.LayoutParams wlp) {
         if (!SET_LAYOUT_PARAMS || wlp == null) return;
-        // View.setLayoutParams only stores and resolves (no parent: a window
-        // root has none), so it cannot fail on a root; guarded anyway, since a
-        // throw here would lose the window the app just asked for.
+        // A window root has a non-View parent, not a container supplying child
+        // LayoutParams. Guard app overrides so they cannot lose the window.
         try { view.setLayoutParams(wlp); } catch (Throwable ignored) { }
     }
 
@@ -196,7 +218,12 @@ public final class WindowOverlayStack {
             for (Layer l : LAYERS) {
                 if (l.view == view) { l.params = wlp; return; }
             }
-            LAYERS.add(new Layer(view, wlp));
+            if (view.getParent() != null) {
+                throw new IllegalStateException("The specified view already has a parent");
+            }
+            Layer layer = new Layer(view, wlp);
+            view.setParent(layer);
+            LAYERS.add(layer);
         }
         // Tell the view it is attached. A window we put on screen genuinely IS
         // attached, but only ViewCanvasDriver ever dispatched this, and only for
@@ -309,10 +336,10 @@ public final class WindowOverlayStack {
     }
 
     public static void remove(View view) {
-        boolean removed = false;
+        Layer removed = null;
         synchronized (LOCK) {
             for (int i = LAYERS.size() - 1; i >= 0; i--) {
-                if (LAYERS.get(i).view == view) { LAYERS.remove(i); sDirty = true; removed = true; break; }
+                if (LAYERS.get(i).view == view) { removed = LAYERS.remove(i); sDirty = true; break; }
             }
         }
         // A removed window's pixels must go with it. AOSP tears down the
@@ -328,7 +355,7 @@ public final class WindowOverlayStack {
         //
         // Scheduling a traversal here defeats the idle-skip for one frame, so
         // whichever compositor painted the overlay repaints without it.
-        if (removed) {
+        if (removed != null) {
             // AOSP WindowManagerGlobal.removeViewLocked -> ViewRootImpl.die ->
             // doDie -> dispatchDetachedFromWindow: a removed window's tree is
             // detached (Dialog.dismissDialog uses removeViewImmediate, so this is
@@ -336,12 +363,15 @@ public final class WindowOverlayStack {
             // detached, so a dismissed dialog's ProgressBar kept ticking forever,
             // pinning its activity and forcing a traversal 20x a second.
             try { view.macapkDispatchDetachedFromWindow(); } catch (Throwable ignored) { }
+            finally {
+                if (view.getParent() == removed) view.setParent(null);
+            }
             try { android.view.ViewRootImpl.schedule(); } catch (Throwable ignored) { }
         }
         // Symmetric with add()'s log above: unambiguous proof a dialog/overlay
         // was actually dismissed (vs. just not re-logged). Cheap (fires only on
         // a real removal), so kept unconditionally like the add() log.
-        if (removed) {
+        if (removed != null) {
             try {
                 NativeLog.i("Mac.apk.Overlay", "removeView " + view.getClass().getName()
                     + " (stack now=" + size() + ")");
