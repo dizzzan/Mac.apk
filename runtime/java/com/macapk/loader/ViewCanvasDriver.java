@@ -1019,6 +1019,7 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
                               || bitmap.getHeight() != surfaceH) {
             bitmap = Bitmap.createBitmapWithCanvasBacking(surfaceW, surfaceH);
             canvas = new Canvas(bitmap);
+            canvas.macapkSetViewRecording(true);
             presentForceFull = true;   // a new bitmap: nothing about the last present carries over
             hb.reset();                // FRAMESPEED heartbeat: a new surface re-proves quiet
         }
@@ -1767,7 +1768,7 @@ public final class ViewCanvasDriver implements MetalSurfaceCallbacks {
             macapkPartialDraw = partialSave >= 0;   // FRAMESPEED S2 (see the field)
             final int opsBefore = canvas.macapkDrawOps;
             try {
-                rootView.draw(canvas);
+                canvas.macapkDrawView(rootView);
             } finally {
                 macapkRootCanvas = null;
                 macapkPartialDraw = false;

@@ -25,7 +25,21 @@ Starting input for another view now drops that stale target, focus loss clears
 it, and the direct-target query checks focus just like the connection query.
 This follows the served-view handoff in AOSP InputMethodManager.checkFocus.
 Typing and backspace were visually verified in Clapper's email field; the test
-string was cleared. Authenticated sign-in still requires the owner's account.
+string was cleared. The owner confirmed that requesting an email code now works.
+
+The verification field exposed two further framework gaps. TextView notified
+registered TextWatchers but never invoked its protected onTextChanged override,
+which custom editors use for completion. All text mutation paths now call the
+subclass hook between watcher onTextChanged and afterTextChanged, with exactly
+one notification per edit. This matches AOSP TextView.setText/handleTextChanged.
+
+The compositor also passed a full-window bitmap Canvas to each child. Custom
+drawing based on Canvas.getHeight consequently centered code digits outside the
+field's clipped bounds. UI compositor canvases now report the current view's
+recording dimensions during that view's draw, matching AOSP View's per-view
+RenderNode.beginRecording(width, height). Nested scopes and exceptions restore
+the parent dimensions; ordinary bitmap canvases retain their original behavior.
+The rebuilt app is awaiting the owner's authenticated sign-in test.
 
 The regression fails on the previous implementation and passes all 13 checks
 with the fix, including touch routing, hide/show lifecycle counts, dismiss while
@@ -41,6 +55,15 @@ mkdir -p runtime/build/dialog-tests
 The input-focus regression also fails before and passes after the fix (14 checks):
 editor switching, restartInput, custom InputConnection routing, non-editor focus,
 explicit hide, and resuming input.
+
+Additional regressions (compile/run with the same classpath above):
+- `debug/TextViewSubclassChangeTest.java`: 16 checks for callback ordering and
+  ranges, setText, typed edits, deletion, in-place Editable edits, append, legacy
+  input, and a four-digit editor completing exactly once with/without watchers.
+  The previous implementation fails the first missing-hook assertion.
+- `debug/ViewRecordingCanvasSizeTest.java`: six checks for child/parent canvas
+  dimensions, actual center-mark pixels within the child's bounds, exception
+  restoration, and unmodified ordinary bitmap drawing.
 
 ## Playback failure and fix
 

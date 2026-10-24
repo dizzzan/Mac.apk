@@ -2974,7 +2974,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
             // (also run on the catch path) returns the canvas to this child's
             // save point so the next sibling draws into a clean transform/clip.
             try {
-                c.draw(canvas);
+                canvas.macapkDrawView(c);
             } catch (Throwable drawErr) {
                 com.macapk.loader.GfxTrace.caught("dispatchDraw:" + c.getClass().getName(), drawErr);
             }
@@ -3790,7 +3790,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         // Resilient draw pass (lead A): one throwing child blanks only itself; the
         // restoreToCount returns the canvas to this child's save point either way.
         try {
-            child.draw(canvas);
+            canvas.macapkDrawView(child);
         } catch (Throwable drawErr) {
             com.macapk.loader.GfxTrace.caught((fromDispatch ? "dispatchDraw:" : "drawChild:")
                     + child.getClass().getName(), drawErr);
@@ -3868,7 +3868,7 @@ public class ViewGroup extends View implements ViewParent, ViewManager {
         // Resilient draw pass (lead A): same per-node guard as dispatchDraw so a
         // direct drawChild() call (RecyclerView item draw, custom ViewGroups)
         // isolates a throwing child instead of aborting the parent's draw.
-        try { child.draw(canvas); }
+        try { canvas.macapkDrawView(child); }
         catch (Throwable drawErr) {
             com.macapk.loader.GfxTrace.caught("drawChild:" + child.getClass().getName(), drawErr);
         } finally { canvas.restoreToCount(save); }

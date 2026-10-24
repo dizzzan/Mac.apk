@@ -326,8 +326,30 @@ public class Canvas {
     public Canvas() { /* no bitmap; draw* calls become no-ops */ }
     public Canvas(Bitmap b) { setBitmap(b); }
 
-    public int getWidth()  { return bitmap != null ? bitmap.getWidth()  : 0; }
-    public int getHeight() { return bitmap != null ? bitmap.getHeight() : 0; }
+    public int getWidth()  { return mViewRecordingWidth >= 0 ? mViewRecordingWidth : bitmap != null ? bitmap.getWidth() : 0; }
+    public int getHeight() { return mViewRecordingHeight >= 0 ? mViewRecordingHeight : bitmap != null ? bitmap.getHeight() : 0; }
+
+    private boolean mViewRecording;
+    private int mViewRecordingWidth = -1, mViewRecordingHeight = -1;
+
+    /** The UI compositor rasterizes hardware view display lists into one
+     * bitmap. AOSP View.updateDisplayListIfDirty begins a RecordingCanvas of
+     * each view's width/height; a translated full-window Canvas reports the
+     * wrong dimensions to custom onDraw implementations. Ordinary bitmap
+     * canvases retain their bitmap dimensions unless the compositor opts in. */
+    public void macapkSetViewRecording(boolean enabled) { mViewRecording = enabled; }
+
+    public void macapkDrawView(android.view.View view) {
+        if (!mViewRecording) { view.draw(this); return; }
+        int previousWidth = mViewRecordingWidth, previousHeight = mViewRecordingHeight;
+        mViewRecordingWidth = view.getWidth();
+        mViewRecordingHeight = view.getHeight();
+        try { view.draw(this); }
+        finally {
+            mViewRecordingWidth = previousWidth;
+            mViewRecordingHeight = previousHeight;
+        }
+    }
     /** AOSP `Canvas.isHardwareAccelerated()`. On a real device the
      *  app window's draw canvas IS hardware accelerated; we report true
      *  to match that (the backing happens to be a BufferedImage, but the

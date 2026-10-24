@@ -752,7 +752,7 @@ public final class WindowOverlayStack {
         if (WINDOW_SHADOW) {
             try { drawWindowShadow(canvas, layer.view); } catch (Throwable ignored) { }
         }
-        layer.view.draw(canvas);
+        canvas.macapkDrawView(layer.view);
     }
 
     /** The shadow half of drawWindow; a no-op for a root with no Z, an empty
@@ -981,6 +981,7 @@ public final class WindowOverlayStack {
         try {
             android.graphics.Bitmap bmp = overlayBitmap(surfaceW, surfaceH);
             android.graphics.Canvas canvas = new android.graphics.Canvas(bmp);
+            canvas.macapkSetViewRecording(true);
             android.graphics.Paint dimPaint = null;
             final int dimAt = topmostDimIndex(layers);
             for (int li = 0; li < layers.size(); li++) {
