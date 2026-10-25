@@ -139,7 +139,7 @@ In [dizzzan/Mac.apk → Actions → Package Mac.apk](https://github.com/dizzzan/
 choose **Run workflow** and select `main` for the integrated stable build. You can
 select a development branch to package a checkpoint instead. Pushing a version
 tag also starts the workflow; the tag must exactly match `v` followed by `VERSION`
-(for example, `v1.0.2303`). A branch run produces downloadable artifacts; a tag run
+(for example, `v1.0.2304`). A branch run produces downloadable artifacts; a tag run
 also publishes a [GitHub Release on the fork](https://github.com/dizzzan/Mac.apk/releases)
 after the packages pass all checks. The publishing job is restricted to
 `dizzzan/Mac.apk`, creates a draft while uploading, and publishes it only when every
