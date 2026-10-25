@@ -55,6 +55,32 @@ Individual overrides take precedence over preset defaults, so old diagnostic
 overrides can change its behavior. The eight assignments above are the saved
 normal-app configuration; debug-harness flags are not needed.
 
+## Larger windows and Java heap capacity
+
+For larger windows or sessions that exhaust the default 1 GiB Java heap, add
+this per-app Environment override and restart Clapper:
+
+```text
+MACAPK_JVM_OPTS=-Xmx4g
+```
+
+This selects a 4 GiB maximum Java heap. It grows as needed; native video/GPU
+buffers and other process memory are additional. It was selected on the test
+Mac with 64 GiB of RAM. Keep this setting local to Clapper. If `MACAPK_JVM_OPTS`
+already contains other options, preserve them and replace any existing `-Xmx`
+option with `-Xmx4g`.
+
+The 2026-10-25 performance investigation found Clapper's old generation at
+99.95% occupancy, with about 7–8 full collections per second and roughly
+75–80% of wall time spent collecting. Large image/rendering pixel arrays
+occupied approximately 470 MiB. Increasing the heap removed that repeated
+full-collection pattern in the initial live-playback checks; the UI compositor
+returned to approximately 60 fps. A 30-second live-playback sample recorded
+zero full collections and 44 ms of total collection time; old-generation use
+rose only from 684 to 687 MiB during that sample. The source stream's frame rate
+is independent of the compositor rate. This is a memory-capacity adjustment, not proof that
+all long-session memory retention has been resolved.
+
 ## Required runtime and recording
 
 Use a fork build containing the compatibility and recording changes. For the
