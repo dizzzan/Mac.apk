@@ -94,6 +94,9 @@ bool Configure(double firstFrame) {
     NSError* error = nil;
     writer = [[AVAssetWriter alloc] initWithURL:temporaryURL fileType:AVFileTypeMPEG4 error:&error];
     if (!writer) { Finish(Error(error)); return false; }
+    // Keep encoder scratch files on the chosen volume too, rather than
+    // letting AVFoundation select a system temporary directory.
+    writer.directoryForTemporaryFiles = outputURL.URLByDeletingLastPathComponent;
     const int w = (videoWidth + 1) & ~1, h = (videoHeight + 1) & ~1;
     videoInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
         AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @(w), AVVideoHeightKey: @(h),
@@ -229,7 +232,9 @@ bool StreamRecorderStart(const std::string& path, std::string& error) {
         if (path.empty() || ![[NSFileManager defaultManager] isWritableFileAtPath:parent.path]) {
             Clear(); failure = "Choose a writable folder for the recording."; return;
         }
-        temporaryURL = [parent URLByAppendingPathComponent:[NSString stringWithFormat:@".macapk-%@.mp4", NSUUID.UUID.UUIDString]];
+        // A visible sibling lets the user see the in-progress recording in
+        // Finder. Rename it only after finalization to preserve an existing file.
+        temporaryURL = [parent URLByAppendingPathComponent:[NSString stringWithFormat:@"Mac.apk recording %@.mp4", NSUUID.UUID.UUIDString]];
         videoWidth = best.width; videoHeight = best.height; lastArrival = now;
         state.store(1); activeSource.store(selected); activeTicket.store(++nextTicket);
         watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, Queue());

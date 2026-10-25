@@ -60,8 +60,16 @@ int main(int argc, char** argv) { @autoreleasepool {
     StreamRecorderObserve(101,320,240);
     require(!StreamRecorderStart(folder + "/missing/movie.mp4", error), "invalid destination rejected");
     for (int take = 0; take < 2; take++) {
+        NSString* selectedFolder = [[NSString stringWithUTF8String:folder.c_str()]
+            stringByAppendingPathComponent:[NSString stringWithFormat:@"Selected recording folder %d", take]];
+        NSFileManager* files = NSFileManager.defaultManager;
+        require([files createDirectoryAtPath:selectedFolder withIntermediateDirectories:NO attributes:nil error:nil], "create selected folder");
+        NSString* destination = [selectedFolder stringByAppendingPathComponent:@"recording.mp4"];
+        NSData* previous = [@"existing-file" dataUsingEncoding:NSUTF8StringEncoding];
+        if (take == 1) require([previous writeToFile:destination atomically:YES], "create existing destination");
+        NSString* inProgress = nil;
         StreamRecorderObserve(101,320,240,take == 1); StreamRecorderObserve(202,160,120,take == 1);
-        std::string path = folder + "/recording-" + std::to_string(take) + ".mp4";
+        std::string path = destination.UTF8String;
         require(StreamRecorderStart(path,error), "start recording");
         require(!StreamRecorderStart(path,error), "duplicate start rejected");
         require(StreamRecorderObserve(202,160,120,take == 1) == 0, "second source excluded");
@@ -79,10 +87,26 @@ int main(int argc, char** argv) { @autoreleasepool {
             for (int c=0;c<2;c++) for (int n=0;n<1600;n++) pcm.floatChannelData[c][n] = .2 * sin(2*M_PI*440*(f*1600+n)/48000.0);
             AVAudioTime* time = [AVAudioTime timeWithHostTime:[AVAudioTime hostTimeForSeconds:host]];
             StreamRecorderAudio((__bridge void*)pcm,(__bridge void*)time);
+            if (f == 30) {
+                require(StreamRecorderState() == 1, "recording remains active");
+                NSArray<NSURL*>* visible = [files contentsOfDirectoryAtURL:[NSURL fileURLWithPath:selectedFolder]
+                    includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+                int movies = 0;
+                for (NSURL* entry in visible) {
+                    if ([entry.lastPathComponent isEqualToString:destination.lastPathComponent] || ![entry.pathExtension isEqualToString:@"mp4"]) continue;
+                    inProgress = entry.path; movies++;
+                }
+                require(movies == 1, "visible in-progress MP4 is in selected folder");
+                if (take == 1)
+                    require([[NSData dataWithContentsOfFile:destination] isEqualToData:previous], "existing destination stays intact while recording");
+                else
+                    require(![files fileExistsAtPath:destination], "final filename waits for successful finalization");
+            }
         }
         StreamRecorderStop(); idle();
         require(StreamRecorderMessage().rfind("Saved ",0)==0,"save succeeds");
-        verify([NSString stringWithUTF8String:path.c_str()]);
+        require(![files fileExistsAtPath:inProgress], "in-progress file renamed after finalization");
+        verify(destination);
     }
     // A failed/no-frame take must preserve an existing destination.
     std::string preserved = folder + "/preserved.mp4";
@@ -106,5 +130,5 @@ int main(int argc, char** argv) { @autoreleasepool {
     usleep(100000);
     StreamRecorderVideo(ticket,std::vector<uint32_t>(640*480,0xffff0000),640,480,StreamRecorderHostSeconds());
     idle(); require(StreamRecorderMessage().find("Video size changed")!=std::string::npos,"resolution change is reported");
-    puts("PASS: no-video, invalid path, duplicate start, source isolation, repeat start/stop, resolution change");
+    puts("PASS: selected-folder staging, visible in-progress file, safe replacement, no-video, invalid path, duplicate start, source isolation, repeat start/stop, resolution change");
 } }
