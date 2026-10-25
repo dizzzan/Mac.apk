@@ -115,6 +115,18 @@ public final class ActivityHost {
     private static final java.util.Map<Activity,Integer> sBackgrounded =
         java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
 
+    /** AOSP ActivityClientRecord starts paused and stopped. An activity that
+     *  finishes in onCreate (for example an OAuth redirect receiver) goes
+     *  straight to onDestroy: performDestroyActivity only pauses/stops phases
+     *  it actually reached. Treating absence from sBackgrounded as RESUMED
+     *  before the first start sent unmatched onActivityStopped callbacks,
+     *  driving apps' started-activity counters negative after redirects.
+     *  Keep this entry until start or teardown, including an off-thread finish
+     *  whose teardown is queued after onCreate returns. */
+    private static final java.util.Set<Activity> sNotStarted =
+        java.util.Collections.newSetFromMap(
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>()));
+
     /** Called by Activity.finish(). AOSP teardown: drive the finishing
      *  activity DOWN (onPause -> onStop -> onDestroy) and dispatch ON_DESTROY to
      *  its LifecycleRegistry. Was just stack.remove(a) -> the activity never
@@ -496,8 +508,9 @@ public final class ActivityHost {
         // onPause/onStop would deliver them twice (and re-entrantly, if the
         // app finishes itself from onStop).
         Integer downTo = sBackgrounded.remove(a);
+        boolean neverStarted = sNotStarted.remove(a);
         try {
-            if (wasTop) {
+            if (wasTop && !neverStarted) {
                 if (downTo == null) {
                     runTolerant(a, "onPause", new Class<?>[0], new Object[0]);
                     if (app != null) app.dispatchActivityPaused(a);
@@ -3522,6 +3535,7 @@ public final class ActivityHost {
         if (outgoingResumed && !WINDOW_ACTIVITY_ON) pauseForNewTop(outgoing);
         noteLaunch(cls, intent);
         push(activity);
+        sNotStarted.add(activity);
         sTaskAlive = true;
         NativeLog.i(TAG, "starting activity " + className);
         // Tolerate exceptions in each lifecycle phase. Real Android crashes
@@ -3723,6 +3737,7 @@ public final class ActivityHost {
         // macapkHandshakeDrainFor).
         macapkLifecycleHandshakeActive = macapkHandshakeDrainFor(activity);
         try {
+        sNotStarted.remove(activity);
         runTolerant(activity, "onStart",  new Class<?>[0], new Object[0]);
         // AOSP ActivityThread.handleStartActivity: performStart() and only THEN
         // performRestoreInstanceState(r.state). The order matters -- onStart is

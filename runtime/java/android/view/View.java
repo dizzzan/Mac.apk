@@ -1830,12 +1830,12 @@ public class View implements android.graphics.drawable.Drawable.Callback,
     public android.os.IBinder getApplicationWindowToken() {
         return macapkAttached ? MACAPK_WINDOW_TOKEN : null;
     }
-    /** AOSP-internal accessor. SmashHit reflectively probes
-     *  View.getViewRootImpl() (then null-checks the result). We have no
-     *  ViewRootImpl object, so we return null -- the same value real Android
-     *  returns for a view that isn't attached to a window's root. Return type
-     *  is Object since the internal ViewRootImpl type isn't modelled. */
-    public Object getViewRootImpl() { return null; }
+    /** AOSP: mAttachInfo != null ? mAttachInfo.mViewRootImpl : null.
+     *  Preserve the typed descriptor for JNI callers as well as reflection.
+     *  The runtime's single host window uses the shared traversal root. */
+    public ViewRootImpl getViewRootImpl() {
+        return macapkAttached ? ViewRootImpl.getInstance() : null;
+    }
     /** REAL attach-state tracking (was hardcoded `true`). The
      *  always-true lie made constructor-time code take attached-only
      *  branches with zero children: MotionLayout.loadLayoutDescription
@@ -1848,6 +1848,17 @@ public class View implements android.graphics.drawable.Drawable.Callback,
      *  is already attached. */
     boolean macapkAttached = false;
     public boolean isAttachedToWindow()                { return macapkAttached; }
+    private static final java.util.concurrent.atomic.AtomicInteger sNextAccessibilityViewId =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private int mAccessibilityViewId = NO_ID;
+
+    /** AOSP's stable per-view accessibility ID is independent of the resource ID. */
+    public synchronized int getAccessibilityViewId() {
+        if (mAccessibilityViewId == NO_ID) {
+            mAccessibilityViewId = sNextAccessibilityViewId.getAndIncrement();
+        }
+        return mAccessibilityViewId;
+    }
     private static boolean warnedAttachThrow = false;
     private static boolean warnedSizeChanged = false;
     /** Class names whose onMeasure has already been reported as throwing.

@@ -17,6 +17,8 @@ import java.net.URL;
 import java.net.URLClassLoader;
 
 public class BaseDexClassLoader extends URLClassLoader {
+    // Android split-module loaders reach this exact field by reflection.
+    private final DexPathList pathList;
 
     /** AOSP signature. dexPath is a colon-separated list of code paths;
      *  optimizedDirectory + librarySearchPath are advisory on a real device
@@ -24,6 +26,7 @@ public class BaseDexClassLoader extends URLClassLoader {
     public BaseDexClassLoader(String dexPath, File optimizedDirectory,
                               String librarySearchPath, ClassLoader parent) {
         super(buildUrls(dexPath), parent);
+        pathList = new DexPathList(this, super.getURLs(), librarySearchPath);
         // ART searches a loader's JNI libraries in path-sorted order; see
         // ArtJniLibraryOrder. Before anything can load through this loader.
         ArtJniLibraryOrder.apply(this);
@@ -33,6 +36,7 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  (AppClassLoader, the no-dex DexClassLoader path). */
     protected BaseDexClassLoader(URL[] urls, ClassLoader parent) {
         super(urls, parent);
+        pathList = new DexPathList(this, urls, null);
         ArtJniLibraryOrder.apply(this);
     }
 
@@ -130,7 +134,8 @@ public class BaseDexClassLoader extends URLClassLoader {
 
     @Override
     protected Class<?> findClass(String name) throws ClassNotFoundException {
-        return super.findClass(binaryName(name));
+        return pathList.isModified() ? pathList.findClass(binaryName(name))
+                : super.findClass(binaryName(name));
     }
 
     /** DexFile.loadClass(name, loader) entry point: define {@code binaryName}
@@ -167,14 +172,8 @@ public class BaseDexClassLoader extends URLClassLoader {
         return "";
     }
 
-    /** AOSP (hidden API): adds a new code path to this loader's DexPathList at
-     *  runtime. Used by androidx MultiDex's pre-API-21 install path and by some
-     *  plugin frameworks. On a real device this re-derives the dex element list;
-     *  here we convert the supplied .dex/.jar/.apk to JVM bytecode (via
-     *  com.macapk.dex, the same path the primary app dex uses) and append the jar to
-     *  this URLClassLoader's search path so subsequent findClass sees it.
-     *  A failure to convert is surfaced lazily at findClass, matching AOSP's
-     *  best-effort behavior of skipping unusable elements. */
+    /** AOSP hidden API: convert and append code to the same mutable path list
+     * used by reflective split installers. Unusable inputs surface at lookup. */
     public void addDexPath(String dexPath) {
         addDexPath(dexPath, false);
     }
@@ -183,50 +182,37 @@ public class BaseDexClassLoader extends URLClassLoader {
      *  trusted (affects hidden-API enforcement on device). Irrelevant here; we
      *  honor only the path side-effect. */
     public void addDexPath(String dexPath, boolean isTrusted) {
-        if (dexPath == null || dexPath.isEmpty()) return;
-        boolean added = false;
-        for (String p : dexPath.split(":")) {
-            if (p.isEmpty()) continue;
-            File f = new File(p);
-            if (!f.isFile()) continue;
-            try {
-                // Real .dex / .apk / .jar code paths need DEX->bytecode; a
-                // plain .jar of class files would also survive conversion (it
-                // tolerates non-dex archives by emitting nothing useful), so we
-                // first try direct-as-jar for .jar inputs and fall back to
-                // conversion. URLClassLoader.addURL is protected; we are the
-                // subclass, so we can call it.
-                URL converted = MacApkDexConverter.convertFileToJarUrl(f);
-                addURL(converted);
-                added = true;
-            } catch (RuntimeException e) {
-                // Lazy surface: leave the path unusable. findClass throws
-                // ClassNotFoundException for its classes, which is what the
-                // on-device "unusable dex element" case also produces.
-            }
-        }
-        if (added) {
-            macapkOpen();
-            // The app's own loader (com.macapk.loader.AppClassLoader) reads
-            // class bytes by reopening the jar BY PATH -- findResource then
-            // URL.openStream -- so it can never have an ephemeral jar unlinked
-            // under it: every class would fall back to URLClassLoader.findClass
-            // and skip ClassFileRewriter. Its ephemeral jar stays on disk,
-            // pid-tagged, and the next process's pruneOnce removes it by dead
-            // pid. Every dalvik.system loader reads through the held fd.
-            if (!isMacApkAppLoader()) macapkReleaseEphemeral();
-        }
+        if (dexPath != null && !dexPath.isEmpty()) pathList.addDexPath(dexPath);
     }
 
-    /** True for com.macapk.loader.AppClassLoader or a subclass of it. Matched
-     *  by NAME so dalvik.system takes no compile-time dependency on the loader
-     *  jar (com.macapk is not shipped in the framework jar). */
-    private boolean isMacApkAppLoader() {
-        for (Class<?> c = getClass(); c != null && c != BaseDexClassLoader.class;
-                c = c.getSuperclass()) {
-            if ("com.macapk.loader.AppClassLoader".equals(c.getName())) return true;
-        }
-        return false;
+    /** Direct URL additions are part of the original JVM path; reflective
+     * edits to dexElements are served in their actual array order. */
+    @Override
+    protected void addURL(URL url) {
+        super.addURL(url);
+        if (pathList != null) pathList.addOriginalURL(url);
+    }
+
+    protected final boolean macapkHasModifiedDexPath() { return pathList.isModified(); }
+
+    /** Register Boot's already-validated conversion for repeated APK loading. */
+    protected final void macapkRegisterInstalledDex(File source, URL jar) {
+        MacApkDexConverter.registerInstalledSource(source, jar);
+    }
+
+    @Override
+    public URL findResource(String name) {
+        return pathList.isModified() ? pathList.findResource(name) : super.findResource(name);
+    }
+
+    @Override
+    public java.util.Enumeration<URL> findResources(String name) throws java.io.IOException {
+        return pathList.isModified() ? pathList.findResources(name) : super.findResources(name);
+    }
+
+    @Override
+    public void close() throws java.io.IOException {
+        try { super.close(); } finally { pathList.close(); }
     }
 
     /** Mac.apk-internal: open every jar on this loader's path NOW, then unlink

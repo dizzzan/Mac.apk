@@ -1,10 +1,13 @@
 #include <cassert>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <thread>
+#include <vector>
 
 static pthread_key_t key;
 static unsigned destroyed;
@@ -15,6 +18,11 @@ static void destroy(void* value) {
 static void* normal(void* value) {
     assert(pthread_setspecific(key, value) == 0);
     return value;
+}
+static std::atomic<unsigned> completed{0};
+static void* detached(void*) {
+    completed.fetch_add(1, std::memory_order_release);
+    return nullptr;
 }
 
 int main(int argc, char** argv) {
@@ -48,6 +56,28 @@ int main(int argc, char** argv) {
         assert(result == expected);
     }
     assert(munmap(code, 16384) == 0);
+    // Detached workers can disappear before the creating thread is scheduled
+    // again. No creator-side operation may dereference their retired handle.
+    struct BionicAttr {
+        uint32_t flags;
+        uint32_t padding;
+        void* stack_base;
+        size_t stack_size;
+        size_t guard_size;
+        int sched_policy;
+        int sched_priority;
+        char reserved[16];
+    } attr{};
+    attr.flags = 1; // PTHREAD_CREATE_DETACHED in Bionic's attribute flags.
+    std::vector<std::thread> creators;
+    for (unsigned c = 0; c < 8; ++c) creators.emplace_back([&] {
+        for (unsigned i = 0; i < 500; ++i) {
+            unsigned long handle;
+            assert(create(&handle, &attr, detached, nullptr) == 0);
+        }
+    });
+    for (auto& creator : creators) creator.join();
+    while (completed.load(std::memory_order_acquire) != 4000) std::this_thread::yield();
     assert(pthread_key_delete(key) == 0);
-    puts("PASS: normal and generated pthread returns, join values, TLS destructor");
+    puts("PASS: pthread returns, join values, TLS destructor, and 4000 detached worker exits");
 }

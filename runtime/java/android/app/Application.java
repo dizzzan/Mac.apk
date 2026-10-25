@@ -838,7 +838,14 @@ public class Application extends ContextWrapper
             pm.macapkSetApplicationMetaTypes(applicationMetaTypes);
             pm.macapkSetVersionInfo(minSdk, targetSdk, versionName, versionCode);
             if (macapkDataDir != null) pm.macapkSetReportedDataDir(macapkDataDir.getAbsolutePath());
-            packageManager = pm;
+            // A subclass constructor can reach here through preferences before
+            // Boot publishes the package and install paths. ContextImpl normally
+            // starts with a populated LoadedApk; our early answer is temporary.
+            // Retaining it would freeze the unknown package/null library path
+            // even after macapkInitInstall, and self queries would hit the
+            // installed-app registry instead of this process's metadata.
+            if (apkPath != null) packageManager = pm;
+            return pm;
         }
         return packageManager;
     }
@@ -960,7 +967,9 @@ public class Application extends ContextWrapper
             return info;
         }
         macapkApplyTestApkPath(info);
-        cachedApplicationInfo = info;
+        // Do not retain the pre-install PackageManager's temporary record.
+        // AOSP ContextImpl returns LoadedApk's fully bound ApplicationInfo.
+        if (apkPath != null) cachedApplicationInfo = info;
         return info;
     }
     // DIAGNOSTIC (MACAPK_TEST_APK_PATH): see macapkCodePath(). Overrides the

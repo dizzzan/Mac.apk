@@ -48,6 +48,7 @@ public final class ViewRootImpl {
     // so the first frame lays out. See ViewCanvasDriver.doFrame.
     private final AtomicBoolean mLayoutRequested = new AtomicBoolean(true);
     private View mView;
+    private AccessibilityInteractionController mAccessibilityInteractionController;
 
     private ViewRootImpl() {}
 
@@ -59,6 +60,19 @@ public final class ViewRootImpl {
         mLayoutRequested.set(true);
     }
     public View getView() { return mView; }
+
+    /** AOSP creates the controller on first request, after a root is installed.
+     *  Merely attaching a view must not imply an active accessibility client. */
+    public AccessibilityInteractionController getAccessibilityInteractionController() {
+        if (mView == null) {
+            throw new IllegalStateException(
+                    "getAccessibilityInteractionController called when there is no mView");
+        }
+        if (mAccessibilityInteractionController == null) {
+            mAccessibilityInteractionController = new AccessibilityInteractionController(this);
+        }
+        return mAccessibilityInteractionController;
+    }
 
     /** invalidate() (and touch / surface-change redraw) calls this to ask for a
      *  measure-skipping DRAW on the next frame. Coalesced / idempotent. */

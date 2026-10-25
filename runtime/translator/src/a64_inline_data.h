@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <vector>
 
 namespace macapk::a64 {
@@ -16,7 +17,8 @@ struct InlineDataRange { uint64_t lo, hi; };
 // branch/address entry. This deliberately does not infer arbitrary indirect
 // branch targets; callers currently enable it only for diagnostic experiments.
 inline std::vector<InlineDataRange> lr_skipped_ranges(const uint8_t* bytes,
-                                                     size_t size, uint64_t base) {
+                                                     size_t size, uint64_t base,
+                                                     const std::function<bool(uint64_t)>& is_code = {}) {
     auto word = [&](size_t off) {
         uint32_t w; std::memcpy(&w, bytes + off, 4); return w;
     };
@@ -28,6 +30,11 @@ inline std::vector<InlineDataRange> lr_skipped_ranges(const uint8_t* bytes,
     for (size_t off = 0; off + 4 <= size; off += 4) {
         uint32_t w = word(off);
         uint64_t pc = base + off;
+        // A PF_X segment can also contain .rodata. Instruction-shaped words
+        // there are not incoming branches: treating an ADR-shaped constant as
+        // an entry can make us rewrite a skipped SVC-shaped data word elsewhere.
+        // Unknown section metadata keeps the conservative old behavior.
+        if (is_code && !is_code(pc)) continue;
         if ((w & 0x7c000000u) == 0x14000000u)
             entries.push_back(pc + sext(w & 0x03ffffffu, 26) * 4);
         else if ((w & 0xff000010u) == 0x54000000u || (w & 0x7e000000u) == 0x34000000u)
@@ -48,6 +55,7 @@ inline std::vector<InlineDataRange> lr_skipped_ranges(const uint8_t* bytes,
         const uint32_t leaf[] = {0xd10043ff, 0xa9007bfd, 0xf94007e0,
                                  0xa9407bfd, 0x910043ff, 0xd65f03c0};
         if (std::memcmp(bytes + h, leaf, sizeof(leaf))) continue;
+        if (is_code && (!is_code(helper) || !is_code(helper + sizeof(leaf) - 4))) continue;
         size_t add = off + 4;
         unsigned source = 0;
         uint32_t next = word(add);
@@ -57,6 +65,7 @@ inline std::vector<InlineDataRange> lr_skipped_ranges(const uint8_t* bytes,
             add += 4;
         }
         if (add + 8 > size) continue;
+        if (is_code && (!is_code(base + add) || !is_code(base + add + 4))) continue;
         uint32_t a = word(add);
         unsigned dest = a & 31u;
         if ((a & 0xffc00000u) != 0x91000000u || ((a >> 5) & 31u) != source || dest == 31) continue;

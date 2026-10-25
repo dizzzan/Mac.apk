@@ -99,6 +99,41 @@ final class MacApkDexConverter {
 
     private MacApkDexConverter() {}
 
+    // Boot has already validated and converted the installed APK (and its
+    // splits). SplitCompat may ask to add that same APK again. Converting it
+    // inside the app JVM can exhaust its smaller heap even though the startup
+    // converter succeeded in a separate process. Reuse only the registered
+    // source while its identity and metadata still match.
+    private static final Map<Path, Map.Entry<java.nio.file.attribute.BasicFileAttributes, URL>>
+            INSTALLED_SOURCES = new ConcurrentHashMap<>();
+
+    static void registerInstalledSource(File source, URL jar) {
+        try {
+            Path path = source.toPath().toRealPath();
+            if (!"file".equals(jar.getProtocol()) || !isValidJar(Path.of(jar.toURI()))) return;
+            INSTALLED_SOURCES.put(path, Map.entry(Files.readAttributes(path,
+                    java.nio.file.attribute.BasicFileAttributes.class), jar));
+        } catch (Exception ignored) { }
+    }
+
+    private static URL installedJar(File source) {
+        try {
+            Path path = source.toPath().toRealPath();
+            var entry = INSTALLED_SOURCES.get(path);
+            if (entry == null) return null;
+            var before = entry.getKey();
+            var now = Files.readAttributes(path, java.nio.file.attribute.BasicFileAttributes.class);
+            if (before.size() == now.size() && before.lastModifiedTime().equals(now.lastModifiedTime())
+                    && java.util.Objects.equals(before.fileKey(), now.fileKey())
+                    && isValidJar(Path.of(entry.getValue().toURI()))) {
+                System.err.println("[macapk] dyn dex: reusing installed conversion for " + source);
+                return entry.getValue();
+            }
+            INSTALLED_SOURCES.remove(path, entry);
+        } catch (Exception ignored) { }
+        return null;
+    }
+
     /** Thrown when the DEX cannot be converted. Callers map this to a faithful
      *  runtime failure (the on-device path would also throw if the DEX could
      *  not be opened). */
@@ -139,12 +174,12 @@ final class MacApkDexConverter {
     /** <javaId12>-<sha256 hex>.jar -- a finished, current or other-build entry. */
     private static final Pattern ENTRY =
             Pattern.compile("^([0-9A-Za-z]{12})-([0-9a-f]{64})\\.jar$");
-    /** <entry>.<pid>.<threadId>.part.jar, plus Main's own ".tmp" sibling. */
+    /** Partial jars and the worker's PID-tagged scratch files. */
     private static final Pattern PART =
-            Pattern.compile("^.+\\.(\\d+)\\.(\\d+)\\.part\\.jar(\\.tmp)?$");
+            Pattern.compile("^.+\\.(\\d+)\\.(\\d+)\\.part\\.jar(\\.tmp|\\.input\\.zip|\\.result)?$");
     /** mem.<pid>.<seq>.jar, plus Main's own ".tmp" sibling. */
     private static final Pattern MEM =
-            Pattern.compile("^mem\\.(\\d+)\\.(\\d+)\\.jar(\\.tmp)?$");
+            Pattern.compile("^mem\\.(\\d+)\\.(\\d+)\\.jar(\\.tmp|\\.input\\.zip|\\.result)?$");
     /** ${java.io.tmpdir}/macapk-dyn.<pid> -- the no-data-dir fallback. */
     private static final Pattern TMP_RUN_DIR = Pattern.compile("^macapk-dyn\\.(\\d+)$");
 
@@ -181,6 +216,8 @@ final class MacApkDexConverter {
      *  re-open it. Otherwise it is ephemeral, exactly like in-memory output.
      *  Never returns null; throws on failure. */
     static URL convertFileToJarUrl(File input) {
+        URL installed = installedJar(input);
+        if (installed != null) return installed;
         List<byte[]> images;
         try {
             // The same reader Main.run(Path, Path) uses, so the image set --
@@ -252,7 +289,7 @@ final class MacApkDexConverter {
             // build-id.txt is exactly when the converter is changing, and a
             // stale entry would load silently under -Xverify:none. No data dir
             // means an offline tool. Either way, convert for this process only.
-            return ephemeralJar(images, what);
+            return ephemeralJar(images, what, true);
         }
         Path dir = cacheDir();
         String name = javaId12 + "-" + cacheKey(javaIdFull, self, images) + ".jar";
@@ -340,7 +377,7 @@ final class MacApkDexConverter {
         Map<String, String> errors = new TreeMap<>();
         Path eph = null;
         try {
-            classes = com.macapk.dex.Main.run(images, part, errors);
+            classes = convertFileImages(images, part, errors);
             if (classes <= 0) {
                 throw new ConvertUnavailableException(
                         "DEX->JAR conversion produced no classes for " + what);
@@ -423,13 +460,18 @@ final class MacApkDexConverter {
     // ---- ephemeral path ----
 
     private static URL ephemeralJar(List<byte[]> images, String what) {
+        return ephemeralJar(images, what, false);
+    }
+
+    private static URL ephemeralJar(List<byte[]> images, String what, boolean fileBacked) {
         Path dir = cacheDir();
         pruneOnce(dir);
         Path out = dir.resolve("mem." + PID + "." + SEQ.incrementAndGet() + ".jar");
         int classes;
         Map<String, String> errors = new TreeMap<>();
         try {
-            classes = com.macapk.dex.Main.run(images, out, errors);
+            classes = fileBacked ? convertFileImages(images, out, errors)
+                    : com.macapk.dex.Main.run(images, out, errors);
         } catch (IOException | RuntimeException e) {
             deleteQuietly(out);
             throw new ConvertUnavailableException("DEX->JAR conversion failed for " + what, e);
@@ -447,6 +489,75 @@ final class MacApkDexConverter {
                 + " ephemeral " + classes + " classes"
                 + (errors.isEmpty() ? "" : ", " + errors.size() + " failed to translate"));
         return u;
+    }
+
+    // A large file-backed feature module can require far more conversion
+    // memory than its running app. Keep that peak in a short-lived JVM, just
+    // as startup conversion does. Serialize workers to bound the host peak.
+    private static final Object LARGE_CONVERSION_LOCK = new Object();
+
+    private static int convertFileImages(List<byte[]> images, Path out,
+                                          Map<String, String> errors) throws IOException {
+        long bytes = 0;
+        for (byte[] image : images) bytes += image.length;
+        if (bytes < (4L << 20)) return com.macapk.dex.Main.run(images, out, errors);
+        synchronized (LARGE_CONVERSION_LOCK) {
+            Path input = Path.of(out + ".input.zip");
+            Path report = Path.of(out + ".result");
+            Process worker = null;
+            try {
+                // Snapshot exactly the images used for the cache key, in order;
+                // a source file changing during conversion cannot poison it.
+                try (var zip = new java.util.zip.ZipOutputStream(Files.newOutputStream(input))) {
+                    zip.setLevel(0);
+                    for (int i = 0; i < images.size(); i++) {
+                        zip.putNextEntry(new java.util.zip.ZipEntry(i == 0 ? "classes.dex" : "classes" + (i + 1) + ".dex"));
+                        zip.write(images.get(i));
+                        zip.closeEntry();
+                    }
+                }
+                String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
+                ProcessBuilder builder = new ProcessBuilder(java, "-Xmx4g", "-XX:+UseParallelGC",
+                        "-cp", System.getProperty("java.class.path"), MacApkDexConverter.class.getName(),
+                        input.toString(), out.toString(), report.toString());
+                // Debug agents/JVM flags belong to the app, not its compiler.
+                builder.environment().remove("JAVA_TOOL_OPTIONS");
+                builder.environment().remove("JDK_JAVA_OPTIONS");
+                builder.environment().remove("_JAVA_OPTIONS");
+                builder.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                builder.redirectError(ProcessBuilder.Redirect.INHERIT);
+                System.err.println("[macapk] dyn dex: converting " + bytes + " bytes in a worker JVM");
+                worker = builder.start();
+                int status = worker.waitFor();
+                if (status != 0) throw new IOException("DEX conversion worker exited " + status);
+                java.util.Properties result = new java.util.Properties();
+                try (InputStream in = Files.newInputStream(report)) { result.load(in); }
+                for (String key : result.stringPropertyNames()) {
+                    if (key.startsWith("error.")) errors.put(key.substring(6), result.getProperty(key));
+                }
+                return Integer.parseInt(result.getProperty("classes"));
+            } catch (InterruptedException e) {
+                if (worker != null) worker.destroyForcibly();
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during DEX conversion", e);
+            } finally {
+                deleteQuietly(input);
+                deleteQuietly(report);
+            }
+        }
+    }
+
+    /** Internal worker entry point; use Main.run so hierarchy and converter
+     * options match in-process conversion, including per-class error reporting. */
+    public static void main(String[] args) throws IOException {
+        if (args.length != 3) throw new IllegalArgumentException("input, output, result required");
+        Map<String, String> errors = new TreeMap<>();
+        int classes = com.macapk.dex.Main.run(com.macapk.dex.Main.readDexes(Path.of(args[0])),
+                Path.of(args[1]), errors);
+        java.util.Properties result = new java.util.Properties();
+        result.setProperty("classes", Integer.toString(classes));
+        for (var error : errors.entrySet()) result.setProperty("error." + error.getKey(), error.getValue());
+        try (var out = Files.newOutputStream(Path.of(args[2]))) { result.store(out, "DEX conversion result"); }
     }
 
     // ---- where ----
