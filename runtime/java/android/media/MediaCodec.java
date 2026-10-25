@@ -187,8 +187,11 @@ public final class MediaCodec {
         public CryptoInfo getCryptoInfo() { return mCryptoInfo; }
     }
 
-    private MediaCodec() {}
-    private MediaCodec(String name) { mName = name; }
+    private MediaCodec() {
+        android.os.Looper looper = android.os.Looper.myLooper();
+        mDefaultCallbackLooper = looper != null ? looper : android.os.Looper.getMainLooper();
+    }
+    private MediaCodec(String name) { this(); mName = name; }
     private String mName = "macapk.null.codec";
 
     /** Can this build actually decode `mime`?
@@ -364,7 +367,10 @@ public final class MediaCodec {
     // -- AOSP documents separate input/output threads as supported even in
     // sync mode) is mid-access.
     private final Object mAsyncLock = new Object();
+    private final android.os.Looper mDefaultCallbackLooper;
     private Callback mCallback;
+    private android.os.Handler mCallbackHandler;
+    private long mAsyncGeneration;
     private Thread mAsyncThread;
     private volatile boolean mAsyncRunning;
     private volatile boolean mAsyncPaused;
@@ -537,8 +543,19 @@ public final class MediaCodec {
     // AOSP: registering a callback before start() (or after flush(), which
     // must be followed by start() again in async mode -- see flush() below)
     // is what switches this codec into asynchronous mode.
-    public void setCallback(Callback cb) { mCallback = cb; }
-    public void setCallback(Callback cb, android.os.Handler handler) { mCallback = cb; }
+    public void setCallback(Callback cb) { setCallback(cb, null); }
+    public void setCallback(Callback cb, android.os.Handler handler) {
+        synchronized (mAsyncLock) {
+            invalidateAsyncCallbacksLocked();
+            mCallback = cb;
+            // Own the Handler so cancellation never removes the app's other
+            // messages. Android delivers codec events on the requested Looper;
+            // native decoders rely on that to serialize their buffer queues
+            // and teardown with these callbacks.
+            mCallbackHandler = cb == null ? null : new android.os.Handler(
+                    handler != null ? handler.getLooper() : mDefaultCallbackLooper);
+        }
+    }
     public void setOnFrameRenderedListener(OnFrameRenderedListener listener, android.os.Handler handler) {}
     public void setVideoScalingMode(int mode) {}
     // AOSP allows swapping the output surface after configure() (adaptive
@@ -559,7 +576,8 @@ public final class MediaCodec {
 
     public void start() {
         synchronized (mAsyncLock) {
-            if (mFormatId != 0 && mSampleRate > 0 && mChannels > 0) {
+            invalidateAsyncCallbacksLocked();
+            if (mDec == 0 && mFormatId != 0 && mSampleRate > 0 && mChannels > 0) {
                 mDec = com.macapk.loader.NativeMedia.nativeDecOpen(mFormatId, mSampleRate, mChannels, mCsd0);
                 if (mDec == 0) {
                     // Loud, not silent -- the same reasoning as the video
@@ -577,7 +595,7 @@ public final class MediaCodec {
                     // family later.
                     throw new CodecException(0, "AudioToolbox: failed to open decoder for formatId " + mFormatId);
                 }
-            } else if (mIsVideo) {
+            } else if (mVidDec == 0 && mIsVideo) {
                 mVidDec = isVp8()
                     ? safeVp8Open(mVidMime, mVidWidth, mVidHeight, mCsd0Vid, mCsd1Vid, mHasSurface)
                     : isVp9()
@@ -640,6 +658,7 @@ public final class MediaCodec {
     }
     public void flush() {
         synchronized (mAsyncLock) {
+            invalidateAsyncCallbacksLocked();
             mOutQ.clear();
             releasePendingVideoFrames();
             if (mVidDec != 0) {
@@ -655,18 +674,21 @@ public final class MediaCodec {
             if (mCallback != null) mAsyncPaused = true;
         }
     }
-    // Signals the async dispatch thread to stop and forgets it, WITHOUT
-    // waiting for it to actually exit. That is safe rather than sloppy: the
-    // thread only ever touches mDec/mIn/mOut/mInFree/mOutFree/mOutQ inside
-    // mAsyncLock (see asyncDispatchLoop), so the caller's next acquisition of
-    // that same lock -- releaseDec(), right after this returns -- cannot run
-    // concurrently with anything the dispatch thread is still mid-way through;
-    // it can only ever run strictly before or strictly after.
+    // Revoke queued events before releasing their buffers. No join: a client
+    // may stop the codec from its own callback. The polling loop checks its
+    // thread identity, so start() cannot revive a previous polling thread.
     private void stopAsyncDispatch() {
         synchronized (mAsyncLock) {
+            invalidateAsyncCallbacksLocked();
             mAsyncRunning = false;
             mAsyncThread = null;
+            mStarted = false;
         }
+    }
+
+    private void invalidateAsyncCallbacksLocked() {
+        ++mAsyncGeneration;
+        if (mCallbackHandler != null) mCallbackHandler.removeCallbacksAndMessages(null);
     }
     // Releases any polled-but-not-yet-released video frames (native
     // CVPixelBuffers) before the index pool that tracks them gets dropped or
@@ -767,18 +789,10 @@ public final class MediaCodec {
         }
     }
 
-    // The async dispatch loop: mirrors dequeueInputBuffer/dequeueOutputBuffer's
-    // own selection logic (tryDequeueOutputLocked, shared with the sync path)
-    // but PUSHES the result through Callback instead of waiting for the app to
-    // poll. The callback is invoked directly (this codebase's existing
-    // MediaPlayer/SoundPool listener-dispatch idiom, not a real Handler/Looper
-    // post) and, critically, OUTSIDE mAsyncLock -- so when the app calls back
-    // into queueInputBuffer()/releaseOutputBuffer() from within its callback
-    // (the normal, expected async usage), that call is a fresh, non-nested
-    // lock acquisition made from THIS SAME thread, never a concurrent one from
-    // a second thread. That is what lets the existing synchronous
-    // queueInputBuffer/releaseOutputBuffer bodies below be reused completely
-    // unchanged for the async path, for BOTH audio and video.
+    // Poll the same backends as synchronous mode, but post availability to the
+    // client's Looper. Never call client code from the polling thread or while
+    // holding the buffer-pool lock. A generation revokes events already
+    // selected/posted when stop, reset, release or flush invalidates buffers.
     private void asyncDispatchLoop() {
         while (true) {
             Callback cb = null;
@@ -786,7 +800,7 @@ public final class MediaCodec {
             int inIdx = -1, outIdx = -1;
             BufferInfo info = null;
             synchronized (mAsyncLock) {
-                if (!mAsyncRunning) return;
+                if (!mAsyncRunning || Thread.currentThread() != mAsyncThread) return;
                 if (mCallback != null && !mAsyncPaused) {
                     cb = mCallback;
                     BufferInfo tmp = new BufferInfo();
@@ -799,14 +813,11 @@ public final class MediaCodec {
                     } else if (!mInFree.isEmpty()) {
                         inIdx = takeInputBufferLocked();
                     }
+                    if (formatChanged || outIdx >= 0 || inIdx >= 0) {
+                        postAsyncCallbackLocked(cb, formatChanged ? getOutputFormat() : null,
+                                                inIdx, outIdx, info);
+                    }
                 }
-            }
-            if (cb != null) {
-                try {
-                    if (formatChanged)    cb.onOutputFormatChanged(this, getOutputFormat());
-                    else if (outIdx >= 0) cb.onOutputBufferAvailable(this, outIdx, info);
-                    else if (inIdx >= 0)  cb.onInputBufferAvailable(this, inIdx);
-                } catch (Throwable ignore) {}
             }
             if (!formatChanged && outIdx < 0 && inIdx < 0) {
                 // Nothing to do this pass (buffers full / queue empty): a
@@ -817,6 +828,22 @@ public final class MediaCodec {
                 catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
             }
         }
+    }
+
+    private void postAsyncCallbackLocked(Callback callback, MediaFormat format,
+                                         int input, int output, BufferInfo info) {
+        final long generation = mAsyncGeneration;
+        mCallbackHandler.post(() -> {
+            synchronized (mAsyncLock) {
+                if (!mAsyncRunning || mAsyncPaused || generation != mAsyncGeneration
+                        || callback != mCallback) return;
+            }
+            try {
+                if (format != null) callback.onOutputFormatChanged(this, format);
+                else if (output >= 0) callback.onOutputBufferAvailable(this, output, info);
+                else callback.onInputBufferAvailable(this, input);
+            } catch (Throwable ignore) { }
+        });
     }
 
     /**

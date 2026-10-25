@@ -4,6 +4,11 @@ import android.view.Surface;
 import java.nio.ByteBuffer;
 import java.io.ByteArrayOutputStream;
 import java.util.*;
+import android.os.Handler;
+import android.os.HandlerThread;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class MediaCodecStreamTest {
     static native byte[] sample(boolean hevc);
@@ -58,6 +63,56 @@ public class MediaCodecStreamTest {
         check(other.macapkLatchBitmap()==null,"unrelated surface does not steal frame");
         c.flush();c.stop();c.release();surface.release();unrelated.release();target.release();other.release();
     }
+    static void decodeAsync(boolean hevc, byte[] bytes, Handler handler) throws Exception {
+        MediaCodec codec = MediaCodec.createDecoderByType(hevc ? "video/hevc" : "video/avc");
+        SurfaceTexture texture = new SurfaceTexture(0);
+        Surface surface = new Surface(texture);
+        codec.configure(MediaFormat.createVideoFormat(hevc ? "video/hevc" : "video/avc", 64, 64), surface, null, 0);
+        // Resume the same decoder after flush as well as alternating codecs.
+        try {
+            for (int pass = 0; pass < 2; ++pass) {
+                CountDownLatch done = new CountDownLatch(1);
+                AtomicReference<Throwable> failure = new AtomicReference<>();
+                final long pts = 1234567 + pass;
+                codec.setCallback(new MediaCodec.Callback() {
+                    int inputs, frames;
+                    boolean format;
+                    void thread() { check(Thread.currentThread() == handler.getLooper().getThread(), "async callback thread"); }
+                    public void onInputBufferAvailable(MediaCodec c, int index) {
+                        try {
+                            thread();
+                            if (inputs++ == 0) {
+                                c.getInputBuffer(index).put(bytes);
+                                c.queueInputBuffer(index, 0, bytes.length, pts, 0);
+                            } else if (inputs == 2) c.queueInputBuffer(index, 0, 0, pts, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                        } catch (Throwable t) { failure.set(t); done.countDown(); }
+                    }
+                    public void onOutputFormatChanged(MediaCodec c, MediaFormat f) {
+                        try { thread(); format = true; }
+                        catch (Throwable t) { failure.set(t); done.countDown(); }
+                    }
+                    public void onOutputBufferAvailable(MediaCodec c, int index, MediaCodec.BufferInfo info) {
+                        try {
+                            thread(); check(format, "format before async output");
+                            if (info.size > 0) { ++frames; check(info.presentationTimeUs == pts, "async PTS"); }
+                            c.releaseOutputBuffer(index, info.size > 0);
+                            if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                                check(frames == 1, "one async decoded frame");
+                                done.countDown();
+                            }
+                        } catch (Throwable t) { failure.set(t); done.countDown(); }
+                    }
+                    public void onError(MediaCodec c, MediaCodec.CodecException e) { failure.set(e); done.countDown(); }
+                }, handler);
+                codec.start();
+                check(done.await(5, TimeUnit.SECONDS), "async decode stalled");
+                if (failure.get() != null) throw new AssertionError("async decode", failure.get());
+                Bitmap bitmap = texture.macapkLatchBitmap();
+                check(bitmap != null && ((bitmap.getPixel(32, 32) >> 16) & 255) > 200, "async decoded red pixels");
+                codec.flush();
+            }
+        } finally { codec.release(); surface.release(); texture.release(); }
+    }
     public static void run() throws Exception {
         for(boolean hevc:new boolean[]{false,true}) {
             byte[] all=sample(hevc);
@@ -70,5 +125,12 @@ public class MediaCodecStreamTest {
             check(i>=0&&(info.flags&MediaCodec.BUFFER_FLAG_END_OF_STREAM)!=0,"EOS before headers");
             empty.releaseOutputBuffer(i,false);empty.stop();empty.release();
         }
+        HandlerThread callbacks = new HandlerThread("stream-test-callbacks");
+        callbacks.start();
+        try {
+            Handler handler = new Handler(callbacks.getLooper());
+            byte[] avc = sample(false), hevc = sample(true);
+            for (int i = 0; i < 16; ++i) decodeAsync(i % 2 != 0, i % 2 == 0 ? avc : hevc, handler);
+        } finally { callbacks.quit(); callbacks.join(5000); }
     }
 }

@@ -12,8 +12,11 @@ with tempfile.TemporaryDirectory(prefix='codec-stream-') as temp:
     out = Path(temp)
     cp = os.pathsep.join(str(repo / 'runtime/build/lib' / name)
                         for name in ('android-framework.jar', 'macapk-loader.jar'))
-    subprocess.run([str(jdk / 'bin/javac'), '-cp', cp, '-d', str(out),
-                    str(repo / 'debug/MediaCodecStreamTest.java')], check=True)
+    java_tests = ['MediaCodecStreamTest', 'MediaCodecCallbackLifecycleTest', 'MediaCodecInputReuseTest']
+    subprocess.run([str(jdk / 'bin/javac'), '-cp', cp, '-d', str(out)] +
+                   [str(repo / 'debug' / (name + '.java')) for name in java_tests], check=True)
+    for name in java_tests[1:]:
+        subprocess.run([str(jdk / 'bin/java'), '-cp', str(out) + os.pathsep + cp, name], check=True)
     args = shlex.split((build / 'CMakeFiles/macapk-runtime.dir/link.txt').read_text())
     args = [x for x in args if 'main.cpp.o' not in x and '-sectcreate' not in x and x != '-DNDEBUG']
     exe = out / 'codec-stream-test'

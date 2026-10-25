@@ -41,6 +41,8 @@ public class MediaCodecInputReuseTest {
         codec.stop();
         CountDownLatch done = new CountDownLatch(32);
         AtomicReference<Throwable> failure = new AtomicReference<>();
+        android.os.HandlerThread callbacks = new android.os.HandlerThread("codec-input-reuse");
+        callbacks.start();
         codec.setCallback(new MediaCodec.Callback() {
             public void onInputBufferAvailable(MediaCodec c, int i) {
                 try {
@@ -55,10 +57,11 @@ public class MediaCodecInputReuseTest {
             }
             public void onOutputFormatChanged(MediaCodec c, MediaFormat f) { }
             public void onError(MediaCodec c, MediaCodec.CodecException e) { failure.set(e); }
-        });
+        }, new android.os.Handler(callbacks.getLooper()));
         codec.start();
         boolean completed = done.await(5, TimeUnit.SECONDS);
         codec.stop(); codec.release();
+        callbacks.quit(); callbacks.join(5000);
         if (!completed) throw new AssertionError("async callbacks stalled");
         if (failure.get() != null) throw new AssertionError("async reuse", failure.get());
         System.out.println("PASS: cached, per-index and asynchronous input reuse clear position/limit/mark");
