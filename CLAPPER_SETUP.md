@@ -78,8 +78,9 @@ full-collection pattern in the initial live-playback checks; the UI compositor
 returned to approximately 60 fps. A 30-second live-playback sample recorded
 zero full collections and 44 ms of total collection time; old-generation use
 rose only from 684 to 687 MiB during that sample. The source stream's frame rate
-is independent of the compositor rate. This is a memory-capacity adjustment, not proof that
-all long-session memory retention has been resolved.
+is independent of the compositor rate. The owner then confirmed smooth playback
+and synchronized sound while browsing live streams. This is a memory-capacity
+adjustment, not proof that all long-session memory retention has been resolved.
 
 ## Required runtime and recording
 
@@ -90,8 +91,9 @@ subsequent crash while switching live streams, also include commit
 threading and lifecycle behavior; it requires no additional environment flag.
 The owner confirmed that scrolling then stayed open and played correctly.
 
-The published `v1.0.2305` release predates that crash fix. The locally installed
-build `261025.1059-b461d69` includes it, despite sharing the 1.0.2305 version number.
+Release **v1.0.2306** includes that crash fix; **v1.0.2305** predates it. The
+4 GiB heap setting above is a per-app option and is not enabled automatically
+by installing the release.
 
 Recording needs no extra flag. Start a stream, click the circle button in the
 app title bar, choose the MP4 destination, and click it again to stop. Temporary
