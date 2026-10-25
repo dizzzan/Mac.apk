@@ -179,9 +179,9 @@ licence. Source: https://github.com/silnrsi/graphite ."
 linked library (Contents/Resources/jre/lib/libglib-2.0.0.dylib), unmodified
 from the Homebrew build of the version named above apart from Mach-O load-path
 metadata. The complete corresponding source (upstream tarball, Homebrew's patch,
-the build recipe) is attached to the same GitHub release as the Mac.apk download
-(https://github.com/kksimp/Mac.apk-Releases/releases), with
-LGPL-SOURCE-README.txt explaining how to use a modified build. Upstream:
+the build recipe) is distributed alongside the Mac.apk download, as individual
+source assets or in macapk-lgpl-sources.tar.gz. LGPL-SOURCE-README.txt in those
+sources explains how to use a modified build. Upstream:
 https://download.gnome.org/sources/glib/ . The LGPL-2.1 text follows."
 
   emit "GNU gettext runtime -- libintl $(kver gettext) (jre/lib/libintl.8.dylib), used by GLib" \
@@ -191,9 +191,9 @@ https://download.gnome.org/sources/glib/ . The LGPL-2.1 text follows."
 in the GLib entry above). It ships as a separate, dynamically linked library,
 unmodified from the Homebrew build of the version named above apart from Mach-O
 load-path metadata. The complete corresponding source (upstream tarball and the
-build recipe) is attached to the same GitHub release as the Mac.apk download
-(https://github.com/kksimp/Mac.apk-Releases/releases); see LGPL-SOURCE-README.txt
-there. Upstream: https://ftp.gnu.org/pub/gnu/gettext/ ."
+build recipe) is distributed alongside the Mac.apk download, as individual source
+assets or in macapk-lgpl-sources.tar.gz; see LGPL-SOURCE-README.txt in those
+sources. Upstream: https://ftp.gnu.org/pub/gnu/gettext/ ."
 
   emit "PCRE2 $(kver pcre2) (jre/lib/libpcre2-8.0.dylib) -- regular expressions, used by GLib" \
        "BSD-3-Clause WITH PCRE2-exception" \

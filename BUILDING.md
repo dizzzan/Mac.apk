@@ -133,6 +133,48 @@ That pulls about 25 GB and takes 30 to 60 minutes the first time.
 identity and notary settings from an untracked `scripts/.release.env` (start from
 `scripts/.release.env.example`). Never commit that file.
 
+### Fork release packages (GitHub Actions)
+
+In [dizzzan/Mac.apk → Actions → Package Mac.apk](https://github.com/dizzzan/Mac.apk/actions/workflows/package-release.yml),
+choose **Run workflow** and select `main` for the integrated stable build. You can
+select a development branch to package a checkpoint instead. Pushing a version
+tag also starts the workflow; the tag must exactly match `v` followed by `VERSION`
+(for example, `v1.0.2303`). A branch run produces downloadable artifacts; a tag run
+also publishes a [GitHub Release on the fork](https://github.com/dizzzan/Mac.apk/releases)
+after the packages pass all checks. The publishing job is restricted to
+`dizzzan/Mac.apk`, creates a draft while uploading, and publishes it only when every
+asset is uploaded. It can resume an interrupted draft for the same commit and
+refuses to overwrite a published release.
+
+The workflow uses an Apple Silicon `macos-26` runner with Xcode 26.6, installs the build
+dependencies, builds API-36 platform resources from AOSP, and runs the existing
+distribution build and parity checks. No Apple signing secrets are needed.
+
+After a successful run, download the **Mac.apk-macos-arm64-…** artifact from the
+run summary. It is retained for 30 days and contains:
+
+- A DMG with `Mac.apk.app` and an Applications shortcut, plus an app ZIP.
+- `SHA256SUMS.txt` and `BUILD.txt` with the source commit and build dependencies.
+- Third-party notices, the project license, and corresponding LGPL sources.
+
+These packages require **Apple Silicon and macOS 26.4 or newer**. They are ad-hoc
+signed, not Developer ID signed or notarized; macOS may require **System Settings
+→ Privacy & Security → Open Anyway** after the first launch attempt. The upstream
+automatic update checker is disabled so a fork build does not offer an upstream
+replacement. Download newer fork packages from Releases or Actions to update.
+
+The identical packaging step can run locally after installing the dependencies
+above (including `libpng` and `libvpx`):
+
+```bash
+scripts/package_release.sh
+(cd build/release && shasum -a 256 -c SHA256SUMS.txt)
+```
+
+It writes `build/release/`, replacing the previous successful package set only
+after verification. It does not install Mac.apk or alter saved app data. Local
+uncommitted changes add `-dirty` to filenames; use a clean checkout for releases.
+
 ## What's not in this repository
 
 - **Private test tools and the app corpus.** The project's full regression gates
