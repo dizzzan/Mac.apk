@@ -27,6 +27,9 @@ finalization. A crash or forced kill can leave an unfinished temporary file.
 
 ## Normal launcher compatibility settings
 
+For the complete tested Clapper configuration, including a paste-ready set of
+environment overrides, see [CLAPPER_SETUP.md](CLAPPER_SETUP.md).
+
 Open an installed app's Get Info panel in Mac.apk and use Compatibility. Changes
 apply on the next launch, including Finder/Dock shortcuts:
 
