@@ -66,8 +66,10 @@ cp LICENSE "$ASSETS/"
     printf 'Signing: ad-hoc (not notarized)\nPlatform: macOS 26.4+, arm64\n'
     printf 'Automatic upstream update check: disabled\n\n'
     sw_vers
-    xcrun swiftc --version
-    brew list --versions cmake openjdk@21 capstone apktool libpng libvpx glib gettext
+    xcrun swiftc --version 2>&1
+    brew list --versions cmake openjdk@21 capstone libpng libvpx glib gettext
+    # A local build may use cached platform resources or an Android SDK's aapt2.
+    brew list --versions apktool || printf 'apktool: not installed (optional with cached resources or external aapt2)\n'
 } > "$ASSETS/BUILD.txt"
 (
     cd "$ASSETS"
