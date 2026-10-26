@@ -1,4 +1,5 @@
 #include "macapk/stream_recorder.h"
+#include "macapk/photo_export.h"
 // cocoa_bridge.mm -- the runtime's Cocoa surface.
 //
 // Owns NSApplication, the single primary NSWindow, and an MTKView used
@@ -4187,6 +4188,7 @@ bool CocoaInit() {
         // onBackPressed path as Esc / Cmd+[.
         InstallBackTitlebarAccessory(g_placeholder_window);
         StreamRecorderInstallTitlebar((void*)g_placeholder_window);
+        PhotoExportInstallTitlebar((void*)g_placeholder_window);
         // v1.0.1649 (phase 2a): the window delegate, BEFORE the optional
         // fullscreen toggle below, so a --fullscreen launch goes through the
         // same fullscreen transition as the green button.

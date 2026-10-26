@@ -126,6 +126,7 @@ set(MACAPK_RUNTIME_SOURCES
     # MACAPK_ELFEXEC, default off. See include/macapk/apk_native_exec.h.
     src/apk_native_exec.cpp
     src/stream_recorder.mm
+    src/photo_export.mm
     src/audio_backend.mm
     # v1.0.940: the MacBook's real microphone and camera.
     #
@@ -195,6 +196,8 @@ set_source_files_properties(thirdparty/stb_vorbis.c PROPERTIES
 # Per-file ARC links cleanly against the MRC .mm files; the only object that
 # crosses the boundary is a __bridge (no-transfer) NSView pointer.
 set_source_files_properties(src/stream_recorder.mm PROPERTIES
+    COMPILE_OPTIONS "-fobjc-arc")
+set_source_files_properties(src/photo_export.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
 set_source_files_properties(src/webview_bridge.mm PROPERTIES
     COMPILE_OPTIONS "-fobjc-arc")
