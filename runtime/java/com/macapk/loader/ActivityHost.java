@@ -2960,7 +2960,20 @@ public final class ActivityHost {
         }
     }
 
-    public static void start(Intent intent) {
+    private static final class LaunchRequest {
+        final Intent intent;
+        final Bundle options;
+        LaunchRequest(Intent intent, Bundle options) {
+            this.intent = intent;
+            this.options = options == null ? null : new Bundle(options);
+            if (this.options != null) {
+                java.util.ArrayList<String> names = options.getStringArrayList("android:activity.sharedElementNames");
+                if (names != null) this.options.putStringArrayList("android:activity.sharedElementNames", new java.util.ArrayList<>(names));
+            }
+        }
+    }
+    public static void start(Intent intent) { start(intent, null); }
+    public static void start(Intent intent, Bundle options) {
         // v1.0.99 pinned the "main thread" to whatever thread ran this method,
         // because that thread constructed the Activity and androidx's
         // LifecycleRegistry.enforceMainThreadIfNeeded rejects an observer add
@@ -3017,7 +3030,7 @@ public final class ActivityHost {
         if (android.os.Looper.MACAPK_REAL_LOOPER
                 && android.os.Looper.macapkIsActivityThread()) {
             notePendingStart(intent);
-            H().obtainMessage(LAUNCH_ACTIVITY, intent).sendToTarget();
+            H().obtainMessage(LAUNCH_ACTIVITY, new LaunchRequest(intent, options)).sendToTarget();
             NativeLog.i(TAG, "M3: posted LAUNCH_ACTIVITY; entering main loop on macapk-activity");
             android.os.Looper.loop();
             // loop() RETURNED. Two possible reasons, needing opposite
@@ -3079,7 +3092,7 @@ public final class ActivityHost {
         if (android.os.Looper.MACAPK_REAL_LOOPER
                 && !android.os.Looper.macapkMainLooperQuit()) {
             notePendingStart(intent);
-            H().obtainMessage(LAUNCH_ACTIVITY, intent).sendToTarget();
+            H().obtainMessage(LAUNCH_ACTIVITY, new LaunchRequest(intent, options)).sendToTarget();
             NativeLog.i(TAG, "M3: startActivity off the activity thread ("
                 + Thread.currentThread().getName()
                 + ") -- posted LAUNCH_ACTIVITY to the main looper (AOSP: launch"
@@ -3092,7 +3105,7 @@ public final class ActivityHost {
         // checks must accept -- the v1.0.99 registration, kept where it is
         // still needed. Idempotent for a thread already registered.
         android.os.Looper.prepareMainLooper();
-        performLaunch(intent);
+        performLaunch(intent, options);
     }
 
     /** Context.startActivities(Intent[]) -- launch a whole back stack.
@@ -3382,7 +3395,8 @@ public final class ActivityHost {
      *  threading a parameter through every call site is not worth the churn. */
     private static Bundle sRelaunchState = null;
 
-    private static void performLaunch(Intent intent) {
+    private static void performLaunch(Intent intent) { performLaunch(intent, null); }
+    private static void performLaunch(Intent intent, Bundle options) {
         // "cleared BEFORE the activity is started" -- so before stack.peek() is
         // read below, because after this the task is empty and there is nothing
         // for the incoming activity to push down. No-op unless
@@ -3470,6 +3484,7 @@ public final class ActivityHost {
                 return;
             }
         }
+        activity.macapkSetEnterActivityOptions(options);
         // AOSP ActivityThread.performLaunchActivity (android11-release
         // ActivityThread.java:3413-3416), between attach and onCreate:
         //     int theme = r.activityInfo.getThemeResource();
@@ -3814,6 +3829,7 @@ public final class ActivityHost {
         currentActivityResumed = true;
         latchWindowAdded(activity, false);
         pushTopWindowTraits(activity);
+        activity.macapkEnterTransitionReady();
         // v1.0.575: blocking handshakes done; macapk-activity returns to its own
         // Looper.loop, so stop the OS-main pump from also draining the main queue.
         } finally {
@@ -4043,9 +4059,10 @@ public final class ActivityHost {
             sH = new android.os.Handler(android.os.Looper.getMainLooper()) {
                 @Override public void handleMessage(android.os.Message msg) {
                     if (msg.what == LAUNCH_ACTIVITY) {
-                        Intent in = (Intent) msg.obj;
+                        LaunchRequest request = msg.obj instanceof LaunchRequest r ? r : new LaunchRequest((Intent) msg.obj, null);
+                        Intent in = request.intent;
                         synchronized (sPendingStarts) { sPendingStarts.remove(in); }
-                        performLaunch(in);
+                        performLaunch(in, request.options);
                         if (ACTIVITY_REUSE) settleDeferredRestore();
                         android.app.Activity.macapkSettleQueuedResult(in);
                     }

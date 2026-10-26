@@ -1,13 +1,6 @@
-// android.app.ActivityOptions -- options for how an Activity launch is
-// animated/placed. On real Android these drive window transitions (scale-up,
-// scene/shared-element, clip-reveal). Mac.apk has a single fixed window with
-// no activity transition animations, so every factory returns a no-op options
-// object and toBundle() returns an empty Bundle. The methods MUST exist,
-// though: apps build options before startActivity(intent, options.toBundle())
-// and an absent factory throws NoSuchMethodError mid-click, dropping the
-// navigation (e.g. F-Droid's app-list row opening AppDetails via
-// makeSceneTransitionAnimation). Signatures mirror AOSP frameworks/base
-// core/java/android/app/ActivityOptions.java.
+// Activity launch options. Scene transitions retain their metadata so the
+// destination can deliver transition callbacks in Mac.apk's single host window.
+// Other animation factories still request no cross-window visual animation.
 package android.app;
 
 import android.content.Context;
@@ -20,6 +13,8 @@ public class ActivityOptions {
     // the literal is inlined per the verified AOSP source value.
     private int mLaunchDisplayId = -1;
 
+    private int mAnimationType;
+    private java.util.ArrayList<String> mSharedElementNames;
     public ActivityOptions() {}
 
     public static ActivityOptions makeBasic() { return new ActivityOptions(); }
@@ -53,22 +48,41 @@ public class ActivityOptions {
 
     // Shared-element (scene) transitions. The varargs Pair<View,String>...
     // form erases to (Activity, android.util.Pair[]) -- the signature F-Droid
-    // invokes. Both forms just return a no-op options object; the launch still
-    // happens, only the cross-activity animation is skipped.
+    // invokes. Keep the scene marker and names through the launch Bundle;
+    // transition completion may gate playback or other application work.
     public static ActivityOptions makeSceneTransitionAnimation(Activity activity,
             View sharedElement, String sharedElementName) {
-        return new ActivityOptions();
+        return makeSceneTransitionAnimation(activity, android.util.Pair.create(sharedElement, sharedElementName));
     }
 
     @SafeVarargs
     public static ActivityOptions makeSceneTransitionAnimation(Activity activity,
             android.util.Pair<View, String>... sharedElements) {
-        return new ActivityOptions();
+        ActivityOptions options = new ActivityOptions();
+        activity.getWindow().getDecorView();
+        if (!activity.getWindow().hasFeature(android.view.Window.FEATURE_ACTIVITY_TRANSITIONS)) return options;
+        options.mAnimationType = 5; // AOSP ANIM_SCENE_TRANSITION
+        options.mSharedElementNames = new java.util.ArrayList<>();
+        if (sharedElements != null) for (android.util.Pair<View, String> pair : sharedElements) {
+            if (pair.first == null || pair.second == null)
+                throw new IllegalArgumentException("Shared element and name must not be null");
+            options.mSharedElementNames.add(pair.second);
+        }
+        return options;
     }
 
-    public Bundle toBundle() { return new Bundle(); }
+    public Bundle toBundle() {
+        Bundle result = new Bundle();
+        result.putInt("android:activity.animType", mAnimationType);
+        if (mSharedElementNames != null)
+            result.putStringArrayList("android:activity.sharedElementNames", new java.util.ArrayList<>(mSharedElementNames));
+        return result;
+    }
 
-    public void update(ActivityOptions otherOptions) {}
+    public void update(ActivityOptions otherOptions) {
+        mAnimationType = otherOptions.mAnimationType;
+        mSharedElementNames = otherOptions.mSharedElementNames == null ? null : new java.util.ArrayList<>(otherOptions.mSharedElementNames);
+    }
 
     public android.graphics.Rect getLaunchBounds() { return null; }
 

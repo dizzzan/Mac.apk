@@ -318,9 +318,8 @@ public class Activity extends ContextThemeWrapper
      *  GameActivity resumed in the same task). */
     public void finishAndRemoveTask() { com.macapk.loader.ActivityHost.macapkFinishAndRemoveTask(this); }
     // AOSP finishAfterTransition: like finish() but plays the shared-element
-    // RETURN transition first. We don't run window transitions (the activity
-    // closes immediately, matching postponeEnterTransition being a no-op), so it
-    // is plain finish(). F-Droid's AppDetails back button calls this.
+    // RETURN transition first. Only the enter lifecycle is currently driven;
+    // return navigation still closes immediately. F-Droid calls this on Back.
     public void finishAfterTransition() { finish(); }
 
     // ---- Lifecycle ----
@@ -1886,6 +1885,7 @@ public class Activity extends ContextThemeWrapper
             if (macapkThemeBool(th, "windowActivityTransitions", false)) {
                 requestFeature(FEATURE_ACTIVITY_TRANSITIONS);
             }
+            macapkInstallActivityTransitions(activity);
 
             // PhoneWindow.java:2467-2474. Both defaults are OPAQUE BLACK, not
             // transparent -- an app that leaves the attributes alone reads
@@ -3204,13 +3204,9 @@ public class Activity extends ContextThemeWrapper
     public void startActivity(Intent intent) {
         com.macapk.loader.ActivityHost.start(intent);
     }
-    // AOSP API-16+ overload: the Bundle is ActivityOptions.toBundle() (launch
-    // animation hints). Mac.apk has no activity transitions, so the options
-    // are ignored -- the launch itself is what matters. Apps pair
-    // ActivityOptions.makeSceneTransitionAnimation(...).toBundle() with this
-    // (e.g. F-Droid's list row opening AppDetails on click).
+    // Preserve scene-transition options through the queued launch.
     public void startActivity(Intent intent, android.os.Bundle options) {
-        com.macapk.loader.ActivityHost.start(intent);
+        com.macapk.loader.ActivityHost.start(intent, options);
     }
     // ---- start-for-result: the requestCode/caller pairing + result delivery ----
     // AOSP threads (caller, requestCode) through ActivityManagerService, so when
@@ -3266,7 +3262,7 @@ public class Activity extends ContextThemeWrapper
         sPendingResult = new PendingResult(this, intent, requestCode);
         boolean started = false;
         try {
-            com.macapk.loader.ActivityHost.start(intent);
+            com.macapk.loader.ActivityHost.start(intent, options);
             started = true;
             // AOSP :5601-5606: `if (requestCode >= 0) mStartedActivity = true;`
             // after execStartActivity returned (a throwing start never sets it).
@@ -3841,19 +3837,33 @@ public class Activity extends ContextThemeWrapper
     public void setEnterSharedElementCallback(SharedElementCallback callback) {}
     public void setExitSharedElementCallback(SharedElementCallback callback) {}
 
-    /** AOSP API-21+ shared-element ENTER-transition postponement. An activity
-     *  opened with a shared-element transition (e.g. F-Droid's AppDetails-
-     *  Activity, opened from a tapped app card) calls postponeEnterTransition()
-     *  in onCreate to hold the transition until its hero image is ready, then
-     *  startPostponedEnterTransition() once loaded. v1.0.396: these were
-     *  ABSENT, so AppDetailsActivity.onCreate hit NoSuchMethodError at the
-     *  postpone call -> onCreate aborted BEFORE wiring its ViewModel/data
-     *  observer -> the detail RecyclerView never got its app and stayed blank.
-     *  We don't run shared-element ENTER transitions (the activity shows
-     *  immediately), so both are no-ops -- onCreate now runs to completion and
-     *  the content binds. General: any shared-element-transition activity. */
-    public void postponeEnterTransition() {}
-    public void startPostponedEnterTransition() {}
+    private boolean mSceneEnter, mSceneHasSharedElements, mSceneReady, mScenePostponed, mSceneCompleted;
+    public final void macapkSetEnterActivityOptions(Bundle options) {
+        mSceneEnter = options != null && options.getInt("android:activity.animType", 0) == 5;
+        java.util.ArrayList<String> names = options == null ? null : options.getStringArrayList("android:activity.sharedElementNames");
+        mSceneHasSharedElements = names != null && !names.isEmpty();
+    }
+    /** Post completion after launch/resume rather than reentering app lifecycle
+     *  methods. There is no cross-window animation in the native compositor. */
+    public final void macapkEnterTransitionReady() {
+        mSceneReady = true;
+        if (!mSceneEnter || mSceneCompleted || mScenePostponed) return;
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            if (isFinishing() || !mSceneReady || mScenePostponed || mSceneCompleted) return;
+            mSceneCompleted = true;
+            Window window = getWindow();
+            if (!window.hasFeature(Window.FEATURE_ACTIVITY_TRANSITIONS)) return;
+            android.transition.Transition shared = mSceneHasSharedElements ? window.getSharedElementEnterTransition() : null;
+            android.transition.Transition enter = window.getEnterTransition();
+            if (shared != null) shared.macapkCompleteAtCurrentState();
+            if (!isFinishing() && enter != null) enter.macapkCompleteAtCurrentState();
+        });
+    }
+    public void postponeEnterTransition() { mScenePostponed = true; }
+    public void startPostponedEnterTransition() {
+        mScenePostponed = false;
+        if (mSceneReady) macapkEnterTransitionReady();
+    }
 
     // -------- v1.0.116 AOSP audit batch (safe subset) --------
     // NOTE: the FULL Activity batch (onBackPressed + onCreatePanelMenu/

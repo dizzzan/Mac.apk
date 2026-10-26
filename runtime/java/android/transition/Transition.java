@@ -811,6 +811,16 @@ public abstract class Transition implements Cloneable {
         }
     }
 
+    /** Activity windows switch without cross-window snapshots. Run a clone at
+     *  the current state, like a transition with no animatable delta, so apps
+     *  waiting for completion can start work after the destination is ready. */
+    public final void macapkCompleteAtCurrentState() { clone().macapkRunAtCurrentState(); }
+    void macapkRunAtCurrentState() {
+        mEnded = false;
+        dispatchStart();
+        dispatchEnd();
+    }
+
     // Package-private (was private): TransitionSet.playTransition() needs to
     // drive the SET's own start/end dispatch directly -- see that method for why.
     void dispatchStart() {
@@ -859,6 +869,8 @@ public abstract class Transition implements Cloneable {
             clone.mStartValuesList = new ArrayList<TransitionValues>();
             clone.mEndValuesList = new ArrayList<TransitionValues>();
             clone.mCurrentAnimators = new ArrayList<Animator>();
+            clone.mEnded = false;
+            clone.mNumInstances = 0;
             return clone;
         } catch (CloneNotSupportedException e) {
             throw new AssertionError(e);

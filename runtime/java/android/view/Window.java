@@ -762,38 +762,60 @@ public abstract class Window {
         return decor;
     }
 
-    // Activity content-transition surface (API 21+). Apps that opt into
-    // shared-element / window transitions configure them on the Window in
-    // onCreate -- e.g. Reddit's IntroductionActivity (the welcome/login
-    // screen) calls setSharedElementsUseOverlay(false) in onCreate; without
-    // the method its onCreate throws NoSuchMethodError and the Compose login
-    // UI never sets up. Mac.apk renders inside an NSWindow with no Android
-    // activity-transition framework, so these are no-ops (the transitions are
-    // purely cosmetic; their absence doesn't change WHICH content shows).
-    public void setSharedElementsUseOverlay(boolean sharedElementsUseOverlay) {}
-    public boolean getSharedElementsUseOverlay() { return true; }
-    public void setEnterTransition(android.transition.Transition transition) {}
-    public void setReturnTransition(android.transition.Transition transition) {}
-    public void setExitTransition(android.transition.Transition transition) {}
-    public void setReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getEnterTransition() { return null; }
-    public android.transition.Transition getReturnTransition() { return null; }
-    public android.transition.Transition getExitTransition() { return null; }
-    public android.transition.Transition getReenterTransition() { return null; }
-    public void setSharedElementEnterTransition(android.transition.Transition transition) {}
-    public void setSharedElementReturnTransition(android.transition.Transition transition) {}
-    public void setSharedElementExitTransition(android.transition.Transition transition) {}
-    public void setSharedElementReenterTransition(android.transition.Transition transition) {}
-    public android.transition.Transition getSharedElementEnterTransition() { return null; }
-    public android.transition.Transition getSharedElementReturnTransition() { return null; }
-    public android.transition.Transition getSharedElementExitTransition() { return null; }
-    public android.transition.Transition getSharedElementReenterTransition() { return null; }
-    public void setAllowEnterTransitionOverlap(boolean allow) {}
-    public boolean getAllowEnterTransitionOverlap() { return true; }
-    public void setAllowReturnTransitionOverlap(boolean allow) {}
-    public boolean getAllowReturnTransitionOverlap() { return true; }
-    public void setTransitionBackgroundFadeDuration(long fadeDurationMillis) {}
-    public long getTransitionBackgroundFadeDuration() { return 0L; }
+    // PhoneWindow transition configuration. Return/reenter inherit their
+    // forward transition unless explicitly configured; null disables one.
+    private final android.transition.Transition[] mActivityTransitions = new android.transition.Transition[8];
+    private final boolean[] mActivityTransitionSet = new boolean[8];
+    private boolean mSharedElementsUseOverlay = true;
+    private boolean mAllowEnterTransitionOverlap = true, mAllowReturnTransitionOverlap = true;
+    private long mTransitionBackgroundFadeDuration = 300;
+    public void setSharedElementsUseOverlay(boolean value) { mSharedElementsUseOverlay = value; }
+    public boolean getSharedElementsUseOverlay() { return mSharedElementsUseOverlay; }
+    public void setEnterTransition(android.transition.Transition value) { mActivityTransitions[0] = value; mActivityTransitionSet[0] = true; }
+    public android.transition.Transition getEnterTransition() { return mActivityTransitions[0]; }
+    public void setReturnTransition(android.transition.Transition value) { mActivityTransitions[1] = value; mActivityTransitionSet[1] = true; }
+    public android.transition.Transition getReturnTransition() { return mActivityTransitionSet[1] ? mActivityTransitions[1] : getEnterTransition(); }
+    public void setExitTransition(android.transition.Transition value) { mActivityTransitions[2] = value; mActivityTransitionSet[2] = true; }
+    public android.transition.Transition getExitTransition() { return mActivityTransitions[2]; }
+    public void setReenterTransition(android.transition.Transition value) { mActivityTransitions[3] = value; mActivityTransitionSet[3] = true; }
+    public android.transition.Transition getReenterTransition() { return mActivityTransitionSet[3] ? mActivityTransitions[3] : getExitTransition(); }
+    public void setSharedElementEnterTransition(android.transition.Transition value) { mActivityTransitions[4] = value; mActivityTransitionSet[4] = true; }
+    public android.transition.Transition getSharedElementEnterTransition() { return mActivityTransitions[4]; }
+    public void setSharedElementReturnTransition(android.transition.Transition value) { mActivityTransitions[5] = value; mActivityTransitionSet[5] = true; }
+    public android.transition.Transition getSharedElementReturnTransition() { return mActivityTransitionSet[5] ? mActivityTransitions[5] : getSharedElementEnterTransition(); }
+    public void setSharedElementExitTransition(android.transition.Transition value) { mActivityTransitions[6] = value; mActivityTransitionSet[6] = true; }
+    public android.transition.Transition getSharedElementExitTransition() { return mActivityTransitions[6]; }
+    public void setSharedElementReenterTransition(android.transition.Transition value) { mActivityTransitions[7] = value; mActivityTransitionSet[7] = true; }
+    public android.transition.Transition getSharedElementReenterTransition() { return mActivityTransitionSet[7] ? mActivityTransitions[7] : getSharedElementExitTransition(); }
+    public void setAllowEnterTransitionOverlap(boolean value) { mAllowEnterTransitionOverlap = value; }
+    public boolean getAllowEnterTransitionOverlap() { return mAllowEnterTransitionOverlap; }
+    public void setAllowReturnTransitionOverlap(boolean value) { mAllowReturnTransitionOverlap = value; }
+    public boolean getAllowReturnTransitionOverlap() { return mAllowReturnTransitionOverlap; }
+    public void setTransitionBackgroundFadeDuration(long value) {
+        if (value < 0) throw new IllegalArgumentException("duration must be non-negative");
+        mTransitionBackgroundFadeDuration = value;
+    }
+    public long getTransitionBackgroundFadeDuration() { return mTransitionBackgroundFadeDuration; }
+
+    /** AOSP PhoneWindow.installDecor: theme transitions are installed only for
+     *  windows with FEATURE_ACTIVITY_TRANSITIONS, preserving app configuration. */
+    public final void macapkInstallActivityTransitions(android.content.Context context) {
+        if (!hasFeature(FEATURE_ACTIVITY_TRANSITIONS)) return;
+        String[] names = {"windowEnterTransition", "windowReturnTransition", "windowExitTransition", "windowReenterTransition", "windowSharedElementEnterTransition", "windowSharedElementReturnTransition", "windowSharedElementExitTransition", "windowSharedElementReenterTransition"};
+        android.content.res.Resources resources = context.getResources();
+        if (resources == null || context.getTheme() == null) return;
+        for (int i = 0; i < names.length; i++) {
+            if (mActivityTransitionSet[i]) continue;
+            int attr = resources.getIdentifier(names[i], "attr", "android");
+            android.util.TypedValue value = new android.util.TypedValue();
+            if (attr == 0 || !context.getTheme().resolveAttribute(attr, value, true)) continue;
+            int id = value.resourceId != 0 ? value.resourceId : value.type == android.util.TypedValue.TYPE_REFERENCE ? value.data : 0;
+            if (id == 0) { mActivityTransitionSet[i] = true; continue; }
+            android.transition.Transition transition = android.transition.TransitionInflater.from(context).inflateTransition(id);
+            mActivityTransitions[i] = transition instanceof android.transition.TransitionSet set && set.getTransitionCount() == 0 ? null : transition;
+            mActivityTransitionSet[i] = true;
+        }
+    }
 
     // API 29 (Android 10) edge-to-edge / contrast enforcement. AOSP doc:
     // "If set, the system will ensure that the status bar / navigation bar

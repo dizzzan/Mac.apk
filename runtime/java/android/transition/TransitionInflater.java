@@ -28,6 +28,14 @@ public class TransitionInflater {
     }
 
     public Transition inflateTransition(int resource) {
+        String name = null;
+        try { name = mContext.getResources().getResourceName(resource); }
+        catch (android.content.res.Resources.NotFoundException ignored) {}
+        if ("android:transition/no_transition".equals(name)) return new TransitionSet();
+        if ("android:transition/fade".equals(name)) return new Fade();
+        if ("android:transition/move".equals(name)) return new TransitionSet()
+                .addTransition(new ChangeBounds()).addTransition(new ChangeTransform())
+                .addTransition(new ChangeClipBounds()).addTransition(new ChangeImageTransform());
         // Without an authored-XML parser we cannot reconstruct the exact tree;
         // an AutoTransition (fade-out / change-bounds / fade-in) is the closest
         // faithful default and is what most declared transitions approximate.

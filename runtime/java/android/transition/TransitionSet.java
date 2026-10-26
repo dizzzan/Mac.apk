@@ -281,6 +281,13 @@ public class TransitionSet extends Transition {
     // transition's onTransitionEnd never firing (its animators' end listeners
     // keep decrementing a mNumInstances the second run already reset).
     @Override
+    void macapkRunAtCurrentState() {
+        dispatchStart();
+        for (Transition child : mTransitions) child.macapkRunAtCurrentState();
+        dispatchEnd();
+    }
+
+    @Override
     public TransitionSet clone() {
         TransitionSet clone = (TransitionSet) super.clone();
         clone.mTransitions = new ArrayList<Transition>();
