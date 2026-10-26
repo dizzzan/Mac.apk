@@ -1,5 +1,7 @@
 # Save a photo to your Mac
 
+Available in fork release **v1.0.2307 or newer**.
+
 Open a photo in the Android app's full-screen viewer, wait for it to load, then
 click **Save photo** (the photo/download icon beside Record in the Mac title
 bar). Choose a destination and save. The dialog shows the image's dimensions.

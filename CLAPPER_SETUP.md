@@ -95,7 +95,10 @@ Release **v1.0.2306** includes that crash fix; **v1.0.2305** predates it. The
 4 GiB heap setting above is a per-app option and is not enabled automatically
 by installing the release.
 
-Recording needs no extra flag. In builds with the DM playback/waiting fix, click
+Release **v1.0.2307** also fixes DM video playback and adds recording that can
+wait for playback and the Save photo title-bar button.
+
+Recording needs no extra flag. In **v1.0.2307 or newer**, click
 the circle button in the app title bar and choose the MP4 destination before
 starting a video. Orange means waiting; red means recording. Click again to
 cancel waiting or stop recording. This works with live streams and DM videos.
@@ -107,7 +110,7 @@ graphics already embedded in the source video remain. See
 
 ## Saving DM photos
 
-In a build with photo export, open the DM photo full-screen and click **Save
+In **v1.0.2307 or newer**, open the DM photo full-screen and click **Save
 photo** beside Record in the Mac title bar. Choose a PNG destination; the dialog
 shows the loaded image's dimensions. The export contains the whole photo,
 without chat or controls, regardless of viewer zoom. No extra flag is required.
