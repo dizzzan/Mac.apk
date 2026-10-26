@@ -38,3 +38,8 @@ native image size, cropping independence, neighboring gallery pages, hidden
 views, ambiguous selection, hardware bitmaps, and snapshot ownership. Its native
 gate round-trips the actual PNG encoder and checks dimensions, row orientation,
 RGB channels, alpha, and invalid-size guards.
+
+The regular installed Clapper 14.6.1 app was tested with its stock DM viewer.
+The visible photo exposed a 1189 × 1212 bitmap while a different gallery photo
+was preloaded offscreen. After installation, the owner successfully saved a DM
+photo using the new title-bar button (2026-10-26).
