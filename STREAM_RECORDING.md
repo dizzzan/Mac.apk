@@ -1,9 +1,13 @@
 # Recording video on a Mac
 
-The circle button at the right of an Android app's title bar starts recording.
-Play a video, click the button, choose an MP4 destination, and click Save. The
-button turns red while recording. Click it again to stop; its tooltip shows the
-saved path. Closing the app also attempts to finish, with a four-second timeout.
+Click the circle button at the right of an Android app's title bar, choose an
+MP4 destination, and click Save. The button turns orange while waiting for video.
+Start the video: recording begins with the next frame and the button turns red.
+You can also start recording a video that is already playing.
+
+Click again to stop recording or cancel waiting. Waiting has no timeout and
+creates no empty file. The tooltip shows the current state or saved path. Closing
+the app attempts to finish an active take, with a four-second timeout.
 
 The MP4 contains H.264 video and AAC stereo audio from the app's audio mixer.
 It does not capture the desktop, microphone, title bar, Android window bitmap,
@@ -12,9 +16,10 @@ into the video source remain. No screen-recording permission is used. This fork'
 explicit recording feature operates independently of FLAG_SECURE; existing
 screenshot and window-sharing policy is unchanged.
 
-Recording selects the largest recently displayed decoded-video source. When a
-player uses software decoding and renders into its own TextureView, that surface
-is used instead. Raw codec frames take priority over rendered surfaces. In a
+Recording selects the first eligible video source to deliver a new frame after
+Save. When a player renders into its own TextureView, that surface can be used
+instead. Raw codec frames arriving after recording is armed take priority over
+rendered copies; a previously paused video does not reserve the recorder. In a
 multi-participant live room this currently records one video source, with the
 room's mixed audio; it does not assemble multiple participant tiles. The selected
 source stays fixed during a take. A resolution change or three seconds without
@@ -61,4 +66,5 @@ JAVA_HOME=/path/to/jdk python3 debug/surface_texture_external_gate.py
 
 The recorder test writes and decodes real H.264/AAC MP4s, checking frame delivery,
 orientation, audible samples, timing, source selection, repeated start/stop,
-resolution changes, and preservation of an existing destination on failure.
+resolution changes, waiting/cancellation, capture from the first frame, and
+preservation of an existing destination on failure.

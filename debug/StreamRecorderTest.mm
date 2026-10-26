@@ -47,6 +47,7 @@ static void verify(NSString* path) {
         for (float value : values) energy += value * value;
         sampleCount += values.size(); CFRelease(sample);
     }
+    require(firstVideo == 0, "first video frame begins at zero");
     require(frames >= 50, "continuous video frame delivery");
     require(sampleCount > 100000 && std::sqrt(energy / sampleCount) > 0.08, "audible decoded AAC samples");
     require(std::abs(firstAudio - firstVideo) < 0.12, "audio/video starts aligned");
@@ -56,10 +57,16 @@ static void verify(NSString* path) {
 int main(int argc, char** argv) { @autoreleasepool {
     require(argc == 2, "output folder argument");
     std::string folder = argv[1], error;
-    require(!StreamRecorderStart(folder + "/empty.mp4", error), "cannot start without video");
+    require(StreamRecorderStart(folder + "/empty.mp4", error), "arm without video");
+    require(StreamRecorderState() == 3, "waiting state exposed");
+    usleep(3300000);
+    require(StreamRecorderState() == 3, "waiting does not time out");
+    require(![[NSFileManager defaultManager] fileExistsAtPath:[NSString stringWithUTF8String:(folder + "/empty.mp4").c_str()]], "waiting creates no empty movie");
+    StreamRecorderStop(); idle();
+    require(StreamRecorderMessage() == "Recording canceled.", "waiting cancellation is not an error");
     StreamRecorderObserve(101,320,240);
     require(!StreamRecorderStart(folder + "/missing/movie.mp4", error), "invalid destination rejected");
-    for (int take = 0; take < 2; take++) {
+    for (int take = 0; take < 3; take++) {
         NSString* selectedFolder = [[NSString stringWithUTF8String:folder.c_str()]
             stringByAppendingPathComponent:[NSString stringWithFormat:@"Selected recording folder %d", take]];
         NSFileManager* files = NSFileManager.defaultManager;
@@ -68,18 +75,22 @@ int main(int argc, char** argv) { @autoreleasepool {
         NSData* previous = [@"existing-file" dataUsingEncoding:NSUTF8StringEncoding];
         if (take == 1) require([previous writeToFile:destination atomically:YES], "create existing destination");
         NSString* inProgress = nil;
-        StreamRecorderObserve(101,320,240,take == 1); StreamRecorderObserve(202,160,120,take == 1);
+        if (take == 2) StreamRecorderObserve(101,320,240); // a paused prior source must not claim the next take
+        else { StreamRecorderObserve(101,320,240,take == 1); StreamRecorderObserve(202,160,120,take == 1); }
         std::string path = destination.UTF8String;
         require(StreamRecorderStart(path,error), "start recording");
         require(!StreamRecorderStart(path,error), "duplicate start rejected");
-        require(StreamRecorderObserve(202,160,120,take == 1) == 0, "second source excluded");
+        require(StreamRecorderState() == 3, "start waits for next video frame");
+
         AVAudioFormat* format = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:48000 channels:2];
         AVAudioPCMBuffer* pcm = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:1600]; pcm.frameLength = 1600;
         const double start = StreamRecorderHostSeconds();
         for (int f = 0; f < 60; f++) {
             while (StreamRecorderHostSeconds() < start + f / 30.0) usleep(500);
             double host = StreamRecorderHostSeconds();
-            auto ticket = StreamRecorderObserve(101,320,240,take == 1);
+            auto ticket = StreamRecorderObserve(take == 2 ? 404 : 101,320,240,take > 0);
+            require(ticket != 0, "first and subsequent frames receive a ticket");
+            require(StreamRecorderObserve(202,160,120,take == 1) == 0, "second source excluded after first frame");
             std::vector<uint32_t> pixels(320*240);
             for (int y=0;y<240;y++) for(int x=0;x<320;x++) pixels[y*320+x] = y < 120 ? 0xffff0000 : 0xff00ff00;
             for (int y=50;y<190;y++) for(int x=70+f*2;x<80+f*2;x++) pixels[y*320+x] = 0xffffffff;
@@ -120,6 +131,7 @@ int main(int argc, char** argv) { @autoreleasepool {
     StreamRecorderObserve(101,320,240);
     StreamRecorderObserve(303,1920,1080,true);
     require(StreamRecorderStart(folder+"/priority.mp4",error), "start raw source priority");
+    require(StreamRecorderObserve(101,320,240) != 0, "new raw frame claims waiting recorder");
     require(StreamRecorderObserve(303,1920,1080,true)==0, "raw codec wins over larger EGL surface");
     StreamRecorderStop(); idle();
     // Resolution changes finalize instead of stretching/mixing unrelated media.
@@ -130,5 +142,5 @@ int main(int argc, char** argv) { @autoreleasepool {
     usleep(100000);
     StreamRecorderVideo(ticket,std::vector<uint32_t>(640*480,0xffff0000),640,480,StreamRecorderHostSeconds());
     idle(); require(StreamRecorderMessage().find("Video size changed")!=std::string::npos,"resolution change is reported");
-    puts("PASS: selected-folder staging, visible in-progress file, safe replacement, no-video, invalid path, duplicate start, source isolation, repeat start/stop, resolution change");
+    puts("PASS: arm before playback, indefinite waiting, cancel without file, first-frame capture, selected-folder staging, visible in-progress file, safe replacement, no-video, invalid path, duplicate start, source isolation, repeat start/stop, resolution change");
 } }

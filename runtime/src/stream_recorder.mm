@@ -32,6 +32,7 @@ NSURL* outputURL;
 NSURL* temporaryURL;
 dispatch_source_t watchdog;
 double origin = -1, lastVideo = -1, lastAudioEnd = -1, lastArrival = 0;
+double armedAt = 0;
 int videoWidth = 0, videoHeight = 0;
 bool hasVideo = false;
 
@@ -56,6 +57,10 @@ void Clear() {
 }
 void Finish(const std::string& reason = "") {
     if (state.load() == 0 || state.load() == 2) return;
+    if (state.load() == 3) {
+        activeTicket.store(0); activeSource.store(0);
+        Clear(); Publish("Recording canceled."); return;
+    }
     activeTicket.store(0); activeSource.store(0); state.store(2);
     if (watchdog) { dispatch_source_cancel(watchdog); watchdog = nil; }
     Publish("Finishing recording…");
@@ -126,7 +131,7 @@ double StreamRecorderHostSeconds() {
     return mach_absolute_time() * scale;
 }
 uint64_t StreamRecorderObserve(uint64_t source, int width, int height, bool renderedSurface) {
-    if (width < 16 || height < 16 || width > 8192 || height > 8192) return 0;
+    if (!source || width < 16 || height < 16 || width > 8192 || height > 8192) return 0;
     const double now = StreamRecorderHostSeconds();
     { std::lock_guard<std::mutex> lock(metadataMutex);
       sources[source] = {width, height, now, renderedSurface};
@@ -134,6 +139,32 @@ uint64_t StreamRecorderObserve(uint64_t source, int width, int height, bool rend
       for (auto it = sources.begin(); it != sources.end();) {
           if (now - it->second.seen > 3) it = sources.erase(it); else ++it;
       }
+    }
+    // Claim the first eligible producer synchronously so its very first frame
+    // receives a ticket. Waiting has no timeout and creates no encoder/file.
+    if (state.load() == 3) {
+        dispatch_sync(Queue(), ^{
+            if (state.load() != 3) return;
+            // A raw decoder frame is preferable to its rendered EGL copy.
+            // Do not bind to a previously seen/paused decoder: a different
+            // video may start immediately and its first frame must be kept.
+            if (renderedSurface) {
+                std::lock_guard<std::mutex> lock(metadataMutex);
+                for (const auto& entry : sources)
+                    if (!entry.second.renderedSurface && entry.second.seen >= armedAt && now - entry.second.seen < 1.5) return;
+            }
+            activeSource.store(source);
+            videoWidth = width; videoHeight = height; lastArrival = now;
+            state.store(1);
+            watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, Queue());
+            dispatch_source_set_timer(watchdog, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
+            dispatch_source_set_event_handler(watchdog, ^{
+                if (StreamRecorderHostSeconds() - lastArrival > 3)
+                    Finish("Video ended or changed; start a new recording to continue.");
+            });
+            dispatch_resume(watchdog);
+            Publish("Recording video and app audio…");
+        });
     }
     return activeSource.load() == source ? activeTicket.load() : 0;
 }
@@ -216,17 +247,6 @@ bool StreamRecorderStart(const std::string& path, std::string& error) {
     __block std::string failure;
     dispatch_sync(Queue(), ^{ @autoreleasepool {
         if (state.load()) { failure = "A recording is already active or finishing."; return; }
-        uint64_t selected = 0; Source best{};
-        const double now = StreamRecorderHostSeconds();
-        { std::lock_guard<std::mutex> lock(metadataMutex);
-          for (const auto& entry : sources) if (now - entry.second.seen < 1.5 &&
-              (!selected || (best.renderedSurface && !entry.second.renderedSurface) ||
-               (best.renderedSurface == entry.second.renderedSurface &&
-                entry.second.width * entry.second.height > best.width * best.height))) {
-              selected = entry.first; best = entry.second;
-          }
-        }
-        if (!selected) { failure = "Play a video first, then start recording."; return; }
         outputURL = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
         NSURL* parent = outputURL.URLByDeletingLastPathComponent;
         if (path.empty() || ![[NSFileManager defaultManager] isWritableFileAtPath:parent.path]) {
@@ -235,13 +255,9 @@ bool StreamRecorderStart(const std::string& path, std::string& error) {
         // A visible sibling lets the user see the in-progress recording in
         // Finder. Rename it only after finalization to preserve an existing file.
         temporaryURL = [parent URLByAppendingPathComponent:[NSString stringWithFormat:@"Mac.apk recording %@.mp4", NSUUID.UUID.UUIDString]];
-        videoWidth = best.width; videoHeight = best.height; lastArrival = now;
-        state.store(1); activeSource.store(selected); activeTicket.store(++nextTicket);
-        watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, Queue());
-        dispatch_source_set_timer(watchdog, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC, NSEC_PER_SEC / 10);
-        dispatch_source_set_event_handler(watchdog, ^{ if (StreamRecorderHostSeconds() - lastArrival > 3) Finish("Video ended or changed; start a new recording to continue."); });
-        dispatch_resume(watchdog);
-        Publish("Recording video and app audio…"); ok = true;
+        armedAt = StreamRecorderHostSeconds();
+        activeSource.store(0); activeTicket.store(++nextTicket); state.store(3);
+        Publish("Waiting for video — play a video to begin recording. Click again to cancel."); ok = true;
     }});
     error = failure; return ok;
 }
@@ -270,9 +286,9 @@ void StreamRecorderFinishOnExit() {
 - (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
 - (void)updateRecording:(NSNotification*)notification {
     const int state = macapk::StreamRecorderState();
-    NSString* label = state == 1 ? @"Stop recording" : state == 2 ? @"Finishing recording" : @"Start recording";
-    self.recordButton.image = [NSImage imageWithSystemSymbolName:state == 1 ? @"stop.circle.fill" : @"record.circle" accessibilityDescription:label];
-    self.recordButton.contentTintColor = state == 1 ? NSColor.systemRedColor : nil;
+    NSString* label = state == 1 ? @"Stop recording" : state == 2 ? @"Finishing recording" : state == 3 ? @"Waiting for video — cancel recording" : @"Start recording";
+    self.recordButton.image = [NSImage imageWithSystemSymbolName:state == 1 ? @"stop.circle.fill" : state == 3 ? @"record.circle.fill" : @"record.circle" accessibilityDescription:label];
+    self.recordButton.contentTintColor = state == 1 ? NSColor.systemRedColor : state == 3 ? NSColor.systemOrangeColor : nil;
     self.recordButton.enabled = state != 2 && !self.choosingDestination;
     self.recordButton.accessibilityLabel = label;
     std::string message = macapk::StreamRecorderMessage();
@@ -287,10 +303,10 @@ void StreamRecorderFinishOnExit() {
     }
 }
 - (void)record:(id)sender {
-    if (macapk::StreamRecorderState() == 1) { macapk::StreamRecorderStop(); return; }
+    if (macapk::StreamRecorderState() == 1 || macapk::StreamRecorderState() == 3) { macapk::StreamRecorderStop(); return; }
     if (macapk::StreamRecorderState() || self.choosingDestination) return;
     NSSavePanel* panel = [NSSavePanel savePanel];
-    panel.title = @"Save video recording"; panel.message = @"Saves the playing video and this app’s audio, without chat or interface overlays.";
+    panel.title = @"Save video recording"; panel.message = @"Choose a file now, then play a video. Recording starts with the next video frame and includes app audio, without chat or interface overlays.";
     panel.allowedContentTypes = @[UTTypeMPEG4Movie]; panel.canCreateDirectories = YES;
     panel.directoryURL = [[NSFileManager defaultManager] URLsForDirectory:NSMoviesDirectory inDomains:NSUserDomainMask].firstObject;
     NSDateFormatter* date = [[NSDateFormatter alloc] init]; date.dateFormat = @"yyyy-MM-dd HH-mm-ss";

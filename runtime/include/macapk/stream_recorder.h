@@ -13,7 +13,8 @@ double StreamRecorderHostSeconds();
 void StreamRecorderAudio(void* pcmBuffer, void* audioTime);
 bool StreamRecorderStart(const std::string& path, std::string& error);
 void StreamRecorderStop();
-// 0 idle, 1 recording, 2 finalizing. Error/saved path are safe to read anywhere.
+// 0 idle, 1 recording, 2 finalizing, 3 waiting for video.
+// Error/saved path are safe to read anywhere.
 int StreamRecorderState();
 std::string StreamRecorderMessage();
 void StreamRecorderInstallTitlebar(void* window);

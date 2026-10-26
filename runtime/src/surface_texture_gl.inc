@@ -99,9 +99,10 @@ jboolean SurfaceTexture_uploadExternalFrame(JNIEnv* env, jclass, jint texture,
 // Intermediate EGL consumers are filtered in Java to avoid recording them twice.
 void SurfaceTexture_recordDecodedFrame(JNIEnv* env, jclass, jlong source, jintArray argb,
                                        jint width, jint height, jint stride, jboolean renderedSurface) {
-    uint64_t ticket = StreamRecorderObserve(source, width, height, renderedSurface);
-    if (!ticket || !argb || stride < width || width <= 0 || height <= 0 ||
+    if (!argb || stride < width || width <= 0 || height <= 0 ||
         int64_t(stride) * (height - 1) + width > env->GetArrayLength(argb)) return;
+    uint64_t ticket = StreamRecorderObserve(source, width, height, renderedSurface);
+    if (!ticket) return;
     const double now = StreamRecorderHostSeconds();
     std::vector<uint32_t> pixels(size_t(width) * height);
     if (stride == width) env->GetIntArrayRegion(argb, 0, width * height, reinterpret_cast<jint*>(pixels.data()));

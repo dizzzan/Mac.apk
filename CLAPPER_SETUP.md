@@ -95,8 +95,11 @@ Release **v1.0.2306** includes that crash fix; **v1.0.2305** predates it. The
 4 GiB heap setting above is a per-app option and is not enabled automatically
 by installing the release.
 
-Recording needs no extra flag. Start a stream, click the circle button in the
-app title bar, choose the MP4 destination, and click it again to stop. Temporary
+Recording needs no extra flag. In builds with the DM playback/waiting fix, click
+the circle button in the app title bar and choose the MP4 destination before
+starting a video. Orange means waiting; red means recording. Click again to
+cancel waiting or stop recording. This works with live streams and DM videos.
+Release v1.0.2306 requires starting playback before recording. Temporary
 recording data is written beside the chosen destination; the final filename
 appears after recording finishes. Android chat and controls are excluded;
 graphics already embedded in the source video remain. See
